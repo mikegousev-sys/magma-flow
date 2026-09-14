@@ -148,8 +148,24 @@ public:
     bool AutoOnce() { return Write("aeag_run_once_save", "1"); }
 
 private:
+    /// Скрипт производителя вызывает свои вспомогательные бинарники
+    /// (i2c_4write, i2c_4read, lut_rw) по ОТНОСИТЕЛЬНОМУ пути "./имя" —
+    /// то есть относительно текущего рабочего каталога ПРОЦЕССА, а не
+    /// каталога самого скрипта. Если magma_vision запущен из другого
+    /// каталога (как в systemd-юните), эти вызовы падают с "No such file
+    /// or directory", а сам скрипт при этом завершается с кодом 0 (bash не
+    /// пробрасывает код ошибки внутренней команды без set -e) — то есть
+    /// Apply() думал бы, что выдержка применена, хотя на деле I2C-запись
+    /// не прошла вообще. Поэтому явно переходим в каталог скрипта перед
+    /// его запуском — тогда относительные пути внутри него разрешаются
+    /// верно независимо от того, откуда запущен сам magma_vision.
     std::string Command(const std::string& tail) const {
-        return config_.script + " " + tail + " -b " +
+        const auto slash = config_.script.find_last_of('/');
+        const std::string dir = (slash == std::string::npos)
+            ? "." : config_.script.substr(0, slash);
+        const std::string file = (slash == std::string::npos)
+            ? config_.script : config_.script.substr(slash + 1);
+        return "cd " + dir + " && ./" + file + " " + tail + " -b " +
                std::to_string(config_.i2c_bus) + " 2>&1";
     }
 

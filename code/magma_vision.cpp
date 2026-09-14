@@ -133,6 +133,7 @@ public:
 
         stop_.store(true);
         if (camera_) camera_->Close();
+        if (camera2_) camera2_->Close();
         broadcaster_->CloseAll();
         if (broadcast_thread.joinable()) broadcast_thread.join();
         std::printf("[VISION] Завершение\n");
@@ -168,6 +169,7 @@ private:
         ApplyStrips();
         ApplyCalibration();
         ApplyExposure();
+        ApplySecondCamera();
         ApplyOutput(is_reload);
 
         config_version_ = VisionIsoTimestamp();
@@ -378,6 +380,89 @@ private:
         exposure_.UpdateConfig(exposure_config_);
     }
 
+    /// ВТОРАЯ КАМЕРА (задел под стереопару, см. magma_stereo.hpp).
+    ///
+    /// Полностью отключена по умолчанию (camera2.device пуст) — ничего не
+    /// открывается и не логируется, пока явно не задан путь к устройству.
+    /// Экспозиция и калибровка — ПОЛНОСТЬЮ НЕЗАВИСИМЫЕ от первой камеры
+    /// наборы параметров (свои veye2.*/calibration2.*/exposure2.*), а не
+    /// зеркалирование настроек первой: камеры физически идентичны, но на
+    /// них может стоять разная оптика (объектив по умолчанию — 30 мм,
+    /// F/6, как у первой камеры, но может быть другим).
+    ///
+    /// ВАЖНО: сюда переносится только детект/подключение/автовыдержка —
+    /// сам расчёт скорости/уровня по-прежнему ведётся ТОЛЬКО по первой
+    /// камере. Подключение второго потока к общему расчёту (триангуляция
+    /// из magma_stereo.hpp) — отдельная, более крупная задача, сознательно
+    /// не делается здесь заодно (см. PROJECT_STATE.md, п.7): она требует
+    /// проверки на реальной паре камер, которой на момент этой правки нет.
+    void ApplySecondCamera() {
+        CaptureConfig next_capture;
+        next_capture.device = config_.GetString("camera2.device", "");
+        camera2_enabled_ = !next_capture.device.empty();
+        if (!camera2_enabled_) return;
+
+        next_capture.width = config_.GetSize("camera2.width", 1280);
+        next_capture.height = config_.GetSize("camera2.height", 1024);
+        next_capture.frame_rate = config_.GetDouble("camera2.frame_rate", 60.0);
+        next_capture.buffer_count = config_.GetSize("camera2.buffer_count", 6);
+        next_capture.timeout_ms = config_.GetInt("camera2.timeout_ms", 2000);
+
+        const std::string signature =
+            next_capture.device + "|" + std::to_string(next_capture.width) + "|" +
+            std::to_string(next_capture.height) + "|" +
+            std::to_string(next_capture.frame_rate);
+        capture_config2_ = next_capture;
+        if (signature != capture_signature2_ || !camera2_) {
+            capture_signature2_ = signature;
+            camera2_needs_reopen_ = true;
+        }
+
+        VeyeConfig next_veye;
+        next_veye.script = config_.GetString("veye2.script",
+                                             "/home/mike/veye/mv_mipi_i2c_new.sh");
+        next_veye.i2c_bus = config_.GetInt("veye2.i2c_bus", 11);
+        if (next_veye.script != veye_config2_.script ||
+            next_veye.i2c_bus != veye_config2_.i2c_bus) {
+            veye2_configured_once_ = false;
+        }
+        veye_config2_ = next_veye;
+        veye2_ = VeyeControl(veye_config2_);
+
+        // Калибровка второй камеры — только ручной путь (без меток): для
+        // одиночного зрения основной путь — метки на борту жёлоба, но для
+        // задела под стереопару, ещё не установленную физически, размечать
+        // метки не по чему. Когда стереопара будет смонтирована, сюда
+        // естественно добавится тот же путь через CalibrationSolver, что и
+        // у первой камеры.
+        calibration2_.elevation_deg = config_.GetDouble("calibration2.beta_deg", 31.0);
+        calibration2_.scale_mm_per_px =
+            config_.GetDouble("calibration2.scale_mm_per_px", 0.4135);
+        calibration2_.flow_angle_deg =
+            config_.GetDouble("calibration2.flow_angle_deg", 0.0);
+        calibration2_.residual_px = 0.0;
+        calibration2_.valid = true;
+
+        exposure_config2_.line_time_us = config_.GetDouble("exposure2.line_time_us", 4.6);
+        exposure_config2_.min_exposure_us = config_.GetInt("exposure2.min_exposure_us", 5);
+        exposure_config2_.frame_rate = capture_config2_.frame_rate;
+        exposure_config2_.min_gain_db = config_.GetDouble("exposure2.min_gain_db", 0.0);
+        exposure_config2_.max_gain_db = config_.GetDouble("exposure2.max_gain_db", 40.0);
+        exposure_config2_.gain_step_db = config_.GetDouble("exposure2.gain_step_db", 0.1);
+        exposure_config2_.gain_increment_db =
+            config_.GetDouble("exposure2.gain_increment_db", 2.0);
+        exposure_config2_.max_blur_px = config_.GetDouble("exposure2.max_blur_px", 3.0);
+        exposure_config2_.target_level = config_.GetDouble("exposure2.target_level", 210.0);
+        exposure_config2_.tolerance = config_.GetDouble("exposure2.tolerance", 15.0);
+        exposure_config2_.max_clipped_fraction =
+            config_.GetDouble("exposure2.max_clipped_fraction", 0.002);
+        exposure_config2_.damping = config_.GetDouble("exposure2.damping", 0.5);
+        exposure_config2_.fallback_speed_ms =
+            config_.GetDouble("exposure2.fallback_speed_ms", 1.5);
+        exposure_config2_.mm_per_px = calibration2_.scale_mm_per_px;
+        exposure2_.UpdateConfig(exposure_config2_);
+    }
+
     /// Сетевые параметры вещания. В отличие от всего перечисленного выше,
     /// адрес и порт СЧИТЫВАЮТСЯ ТОЛЬКО ПРИ ПЕРВОМ ЗАПУСКЕ: перепривязка уже
     /// слушающего сокета требует остановки и повторного запуска потока
@@ -446,10 +531,91 @@ private:
         }
     }
 
+    // ---- Вторая камера: та же логика открытия/выдержки, независимо ----
+
+    bool EnsureCamera2Open() {
+        if (camera2_ && camera2_->IsOpen() && !camera2_needs_reopen_) return true;
+
+        camera2_ = std::make_unique<Camera>(capture_config2_);
+        camera2_needs_reopen_ = false;
+        if (camera2_->Open()) {
+            std::printf("[VISION] Камера 2 открыта: %s, %zux%zu @ %.0f к/с\n",
+                        capture_config2_.device.c_str(), capture_config2_.width,
+                        capture_config2_.height, capture_config2_.frame_rate);
+            ApplyExposureToCamera2(exposure2_.Current());
+            return true;
+        }
+
+        Warn("Камера 2 не открыта (" + camera2_->LastError() + "), попробую перед "
+            "следующей серией");
+        camera2_.reset();
+        return false;
+    }
+
+    void ApplyExposureToCamera2(const ExposureSetting& setting) {
+        if (!veye2_.Available()) return;
+        const auto applied = veye2_.Apply(setting.exposure_us, setting.gain_db);
+        if (applied.ok) {
+            actual_exposure_us2_ = applied.exposure_us;
+            actual_gain_db2_ = applied.gain_db;
+        }
+    }
+
+    /// Один цикл камеры 2: захват серии только для измерения яркости и
+    /// подстройки выдержки — расчёт скорости/уровня по ней пока не ведётся
+    /// (см. комментарий в ApplySecondCamera). Захват полного кадра нужен
+    /// всё равно: FrameStats считается по реальным пикселям, а не по
+    /// метаданным.
+    void RunSecondCameraBurst() {
+        if (!camera2_enabled_) return;
+        if (!EnsureCamera2Open()) return;
+
+        if (!veye2_configured_once_) {
+            if (veye2_.Available()) {
+                if (!veye2_.SetManualMode()) {
+                    Warn("Камера 2: не удалось перевести в ручной режим: " +
+                        veye2_.LastError());
+                }
+                veye2_.SetFrameRate(capture_config2_.frame_rate);
+            } else {
+                Warn("Камера 2: скрипт управления (" + veye_config2_.script +
+                    ") недоступен — выдержка останется той, что задана извне");
+            }
+            veye2_configured_once_ = true;
+        }
+
+        FrameStats accumulated_stats;
+        bool have_stats = false;
+        const CaptureStats capture = camera2_->CaptureBurst(
+            schedule_.burst_frames,
+            [&](const GrayImage& image, std::size_t) {
+                if (!have_stats) {
+                    accumulated_stats =
+                        FrameStats::Measure(image.data, image.width * image.height);
+                    have_stats = true;
+                }
+            },
+            schedule_.warmup_frames, &stop_);
+
+        if (!capture.Ok()) {
+            Warn("Камера 2: серия не удалась: принято " +
+                std::to_string(capture.received) + ", ошибок " +
+                std::to_string(capture.errors));
+            camera2_needs_reopen_ = capture.errors > 0;
+            return;
+        }
+
+        const ExposureSetting next_exposure =
+            exposure2_.Update(accumulated_stats, /*speed_hint=*/-1.0);
+        if (next_exposure.changed) ApplyExposureToCamera2(next_exposure);
+    }
+
     // -------------------------------------------------------------------
     // Одна серия: захват, расчёт обеих величин, подстройка выдержки, отчёт
     // -------------------------------------------------------------------
     void RunBurst() {
+        RunSecondCameraBurst();   // независимо от первой; см. комментарий выше
+
         if (!EnsureCameraOpen()) {
             SendReport(FlowResult{}, LevelResult{}, CaptureStats{});
             return;
@@ -796,6 +962,21 @@ private:
     // выдержка
     ExposureConfig exposure_config_;
     ExposureController exposure_{ExposureConfig{}};
+
+    // вторая камера (задел под стереопару — см. ApplySecondCamera)
+    bool camera2_enabled_ = false;
+    CaptureConfig capture_config2_;
+    std::string capture_signature2_;
+    bool camera2_needs_reopen_ = true;
+    std::unique_ptr<Camera> camera2_;
+    VeyeConfig veye_config2_;
+    VeyeControl veye2_{VeyeConfig{}};
+    bool veye2_configured_once_ = false;
+    double actual_exposure_us2_ = 0.0;
+    double actual_gain_db2_ = 0.0;
+    CameraCalibration calibration2_;
+    ExposureConfig exposure_config2_;
+    ExposureController exposure2_{ExposureConfig{}};
 
     std::atomic<bool> stop_{false};
 };
