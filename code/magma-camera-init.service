@@ -1,0 +1,14 @@
+[Unit]
+Description=MAGMA - init MV-MIPI-SC130M camera via media-ctl/V4L2 (survives reboot, not sleep)
+Before=magma-vision.service
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/mike/magma/camera-init-retry.sh
+User=root
+
+[Install]
+WantedBy=multi-user.target

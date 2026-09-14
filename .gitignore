@@ -1,0 +1,13 @@
+# Скомпилированные бинарники (собираются из исходников на целевой машине)
+code/magma_server
+code/magma_vision
+code/magma_client
+code/magma_client_logging
+code/magma_vision_client
+*.o
+*.obj
+
+# Временные/диагностические файлы
+*.raw
+*.log
+/tmp/
