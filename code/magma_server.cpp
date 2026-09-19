@@ -21,6 +21,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <termios.h>
@@ -47,7 +48,12 @@ namespace magma {
 // =============================================================================
 
 struct SerialConfig {
-    std::string port = "/dev/ttyUSB0";  // через CH340G; GPIO-UART = /dev/ttyAMA0
+    // Пусто — автоопределение по /dev/ttyUSB*/ttyACM* (плата переезжает между
+    // портами при переподключении без перезагрузки Pi, см. случай 2026-09-19:
+    // плату переключили физически, она стала ttyUSB1 вместо ttyUSB0, сервер
+    // с фиксированным путём тихо ждал несуществующий порт до ребута). Чтобы
+    // жёстко закрепить порт (например GPIO-UART /dev/ttyAMA0), укажите его явно.
+    std::string port = "";  // через CH340G
     // 500000 бод делится нацело и от 16 МГц у ATmega328P, и от 12 МГц у CH340G,
     // поэтому погрешности нет ни на одной стороне канала. Загрузка линии 24%.
     speed_t baudrate = B500000;
@@ -229,11 +235,28 @@ private:
         return checksum;
     }
 
-    int OpenPort() {
-        const int port = ::open(config_.port.c_str(), O_RDWR | O_NOCTTY);
+    /// Кандидаты для автоопределения, в порядке проверки: сначала USB-serial
+    /// адаптеры (CH340 на Arduino Nano — /dev/ttyUSBn), затем платы с родным
+    /// USB CDC ACM (Uno/Leonardo/клоны нового образца — /dev/ttyACMn).
+    static std::vector<std::string> ListCandidatePorts() {
+        std::vector<std::string> found;
+        for (const char* pattern : {"/dev/ttyUSB*", "/dev/ttyACM*"}) {
+            glob_t result{};
+            if (::glob(pattern, 0, nullptr, &result) == 0) {
+                for (std::size_t i = 0; i < result.gl_pathc; ++i) {
+                    found.emplace_back(result.gl_pathv[i]);
+                }
+            }
+            ::globfree(&result);
+        }
+        std::sort(found.begin(), found.end());
+        return found;
+    }
+
+    int TryOpen(const std::string& path) {
+        const int port = ::open(path.c_str(), O_RDWR | O_NOCTTY);
         if (port < 0) {
-            std::printf("[UART] Не открыть %s: %s. Повтор через 2 с\n",
-                        config_.port.c_str(), std::strerror(errno));
+            std::printf("[UART] Не открыть %s: %s\n", path.c_str(), std::strerror(errno));
             return -1;
         }
         termios options{};
@@ -250,12 +273,31 @@ private:
 
         // Пауза на перезагрузку Arduino, вызванную открытием порта.
         std::printf("[UART] Открыт %s, жду перезапуска платы (%.0f с)...\n",
-                    config_.port.c_str(), config_.reset_delay_s);
+                    path.c_str(), config_.reset_delay_s);
         std::this_thread::sleep_for(
             std::chrono::duration<double>(config_.reset_delay_s));
         ::tcflush(port, TCIFLUSH);
-        std::printf("[UART] Готов к приёму\n");
+        std::printf("[UART] Готов к приёму (%s)\n", path.c_str());
         return port;
+    }
+
+    int OpenPort() {
+        // Явно заданный порт (например /dev/ttyAMA0 для GPIO-UART) — без автопоиска.
+        if (!config_.port.empty()) return TryOpen(config_.port);
+
+        const std::vector<std::string> candidates = ListCandidatePorts();
+        if (candidates.empty()) {
+            std::printf("[UART] USB-плата не найдена (нет /dev/ttyUSB*|ttyACM*). "
+                        "Повтор через 2 с\n");
+            return -1;
+        }
+        for (const std::string& path : candidates) {
+            const int port = TryOpen(path);
+            if (port >= 0) return port;
+        }
+        std::printf("[UART] Ни один из %zu найденных портов не открылся. "
+                    "Повтор через 2 с\n", candidates.size());
+        return -1;
     }
 
     /// Разобрать кадры с маркером и контрольной суммой; вернуть остаток.
