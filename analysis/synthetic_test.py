@@ -20,6 +20,8 @@ def main():
     ap.add_argument("--fps", type=float, default=60)
     ap.add_argument("--seconds", type=float, default=20)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--dup-every", type=int, default=0,
+                    help="каждый N-й кадр - повтор предыдущего (как в записи экрана)")
     a = ap.parse_args()
 
     rng = np.random.default_rng(a.seed)
@@ -38,8 +40,13 @@ def main():
         cv2.circle(static, (cx, 140), 6, 200, -1)
 
     vw = cv2.VideoWriter(a.out, cv2.VideoWriter_fourcc(*"mp4v"), a.fps, (W, H))
+    uniq = 0
     for i in range(n):
-        off = a.v * i
+        if a.dup_every and i % a.dup_every == a.dup_every - 1:
+            vw.write(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
+            continue
+        off = a.v * uniq
+        uniq += 1
         i0 = int(np.floor(off))
         fr = off - i0
         seg = (1 - fr) * tex[:, i0:i0 + W] + fr * tex[:, i0 + 1:i0 + 1 + W]  # сдвиг влево
@@ -49,7 +56,8 @@ def main():
         img = np.clip(img, 0, 255).astype(np.uint8)
         vw.write(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
     vw.release()
-    print(f"{a.out}: {n} кадров, истинная скорость {a.v} px/кадр = {a.v * a.fps:.1f} px/с")
+    print(f"{a.out}: {n} кадров ({uniq} уникальных), истинная скорость "
+          f"{a.v} px/уник.кадр = {a.v * uniq / n * a.fps:.1f} px/с")
 
 
 if __name__ == "__main__":
