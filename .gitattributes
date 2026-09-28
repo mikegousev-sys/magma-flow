@@ -1,0 +1,2 @@
+# Видео храним в Git LFS
+videos/** filter=lfs diff=lfs merge=lfs -text
