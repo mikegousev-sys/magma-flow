@@ -76,6 +76,54 @@ def level_from_half_width(P, b, side):
     return float(np.interp(b, hw, zs))
 
 
+def crust_edges(med, valid, y_axis, sign, step=4):
+    """Край корки A по каждому столбцу X (вдоль течения) изображения med в повёрнутой системе:
+    идём от оси (строка y_axis) в сторону sign (+1/-1) и берём самую дальнюю от оси точку
+    ярче середины между потоком и фоном (тёмные пятна текстуры внутри потока не мешают).
+    Возвращает координаты Y края для столбцов, где фон за краем виден."""
+    H, W = med.shape
+    edges = []
+    if not 0 <= y_axis < H:
+        return np.array(edges)
+    for X in range(0, W, step):
+        col_ok = valid[:, X]
+        ys = np.arange(y_axis, 0 if sign < 0 else H - 1, int(sign))
+        ys = ys[col_ok[ys]]
+        if len(ys) < 40 or not col_ok[y_axis]:
+            continue
+        prof = cv2.GaussianBlur(med[ys, X].astype(np.float32)[:, None], (1, 9), 0)[:, 0]
+        bgl = np.median(prof[-15:])                              # фон за краем
+        top = np.percentile(prof[:max(5, len(prof) // 3)], 90)
+        if top - bgl < 5:
+            continue
+        above = np.flatnonzero(prof >= (top + bgl) / 2)
+        if len(above) and len(ys) - above[-1] >= 15:              # иначе фон в столбце не виден
+            edges.append(ys[above[-1]])
+    return np.array(edges, float)
+
+
+def section(P, z, n=4000):
+    """Живое сечение при уровне z, мм: x (мм), глубина (м), площадь (м²), смоченные полуширины (мм)."""
+    xs = np.linspace(P[:, 0].min(), P[:, 0].max(), n)
+    dep = np.clip(z - np.interp(xs, P[:, 0], P[:, 1]), 0, None) / 1000.0
+    wet = dep > 0
+    bL, bR = (-xs[wet].min(), xs[wet].max()) if wet.any() else (0.0, 0.0)
+    return xs, dep, float(np.trapezoid(dep, xs / 1000.0)), bL, bR
+
+
+def surface_flow(xs, dep, r_s, u_s, bL, bR):
+    """Расход при k = 1, м³/с: интеграл скорости поверхности u_s(|x|) на глубину. За последней
+    точкой профиля скорости (под коркой) - линейный спад до 0 у стенки."""
+    def u_at(r, bw):
+        r = np.abs(r)
+        u = np.interp(r, r_s, u_s)
+        tail = r > r_s[-1]
+        u[tail] = u_s[-1] * np.clip((bw - r[tail]) / max(bw - r_s[-1], 1e-6), 0, 1)
+        return u
+    u_x = np.where(xs >= 0, u_at(xs, bR), u_at(xs, bL))
+    return float(np.trapezoid(u_x * dep, xs / 1000.0))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("speed_dir")
@@ -123,29 +171,9 @@ def main():
         sys.exit(f"Не удалось прочитать кадры {tm.lo}..{tm.hi - 1} из {a.video}")
     valid = cv2.warpAffine(np.ones(src_hw, np.uint8), A, (W, H), flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP) > 0
     med = np.median(np.array(frames), axis=0)         # uint8: 60 кадров 1600x1600 без float-копий
-    Y_axis = int(round(H / 2 + n_axis))
-    edges = []
-    for X in range(0, W, 4):
-        col_ok = valid[:, X]
-        # идём от оси в сторону края, пока не выйдем на фон
-        ys = np.arange(Y_axis, 0 if edge_sign < 0 else H - 1, int(edge_sign))
-        ys = ys[col_ok[ys]]
-        if len(ys) < 40 or not col_ok[Y_axis]:
-            continue
-        prof = cv2.GaussianBlur(med[ys, X][:, None], (1, 9), 0)[:, 0]
-        bgl = np.median(prof[-15:])                 # фон за краем
-        top = np.percentile(prof[:max(5, len(prof) // 3)], 90)
-        if top - bgl < 5:
-            continue
-        above = np.flatnonzero(prof >= (top + bgl) / 2)
-        # ищем со стороны фона: самая дальняя от оси точка выше порога
-        # (тёмные пятна текстуры внутри потока так не мешают)
-        if not len(above) or len(ys) - above[-1] < 15:
-            continue                                # фон в столбце не виден (край вне кадра)
-        edges.append(ys[above[-1]] - H / 2)
+    edges = crust_edges(med, valid, int(round(H / 2 + n_axis)), edge_sign) - H / 2
     if len(edges) < 10:
         sys.exit("Край корки не найден")
-    edges = np.array(edges)
     n_edge = float(np.median(edges))
     d_px = abs(n_axis - n_edge)
     b = d_px * a.scale_normal + a.crust
@@ -193,23 +221,8 @@ def main():
                           f"({np.abs(P[:, 0]).max():.0f} мм); край или ось найдены неверно",
                           speed_line], level_mm=None)
         sys.exit(1)
-    xs = np.linspace(P[:, 0].min(), P[:, 0].max(), 4000)
-    zb = np.interp(xs, P[:, 0], P[:, 1])
-    dep = np.clip(z - zb, 0, None) / 1000.0                    # м
-    area = float(np.trapezoid(dep, xs / 1000.0))
-    wet = dep > 0
-    bL, bR = (-xs[wet].min(), xs[wet].max()) if wet.any() else (0.0, 0.0)
-
-    def u_at(r, bw):
-        r = np.abs(r)
-        u = np.interp(r, r_s, u_s)
-        # за последней точкой профиля - линейный спад до 0 у стенки
-        tail = r > r_s[-1]
-        u[tail] = u_s[-1] * np.clip((bw - r[tail]) / max(bw - r_s[-1], 1e-6), 0, 1)
-        return u
-
-    u_x = np.where(xs >= 0, u_at(xs, bR), u_at(xs, bL))
-    q_surf = float(np.trapezoid(u_x * dep, xs / 1000.0))       # м3/с при k = 1
+    xs, dep, area, bL, bR = section(P, z)
+    q_surf = surface_flow(xs, dep, r_s, u_s, bL, bR)           # м3/с при k = 1
     kmin, kmax = (float(v) for v in a.k.split(","))
     u_mean_s = q_surf / area if area > 0 else np.nan
 
