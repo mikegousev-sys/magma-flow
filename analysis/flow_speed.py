@@ -76,6 +76,48 @@ def parse_roi(s):
     return x, y, w, h
 
 
+def auto_roi(video, consecutive, nframes, samples=120, dup_thr=1.0):
+    """ROI по карте движения: средний |I(t)-I(t-1)| по парам соседних кадров,
+    разбросанных по всему видео; берётся рамка самой большой подвижной области."""
+    cap = cv2.VideoCapture(video)
+    acc, cnt = None, 0
+    for j in np.linspace(1, max(1, nframes - 1), samples).astype(int):
+        if not consecutive(j):
+            k = j + 1
+            while k < nframes and not consecutive(k) and k < j + 400:
+                k += 1
+            j = k
+        cap.set(cv2.CAP_PROP_POS_FRAMES, j - 1)
+        ok1, f1 = cap.read()
+        ok2, f2 = cap.read()
+        if not (ok1 and ok2):
+            continue
+        g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g1 *= 100.0 / (g1.mean() + 1e-3)
+        g2 *= 100.0 / (g2.mean() + 1e-3)
+        d = np.abs(cv2.GaussianBlur(g2 - g1, (0, 0), 2.0))
+        if d.mean() < dup_thr * 0.1:
+            continue
+        acc = d if acc is None else acc + d
+        cnt += 1
+    cap.release()
+    if not cnt:
+        return None, None
+    m = cv2.GaussianBlur(acc / cnt, (0, 0), 8)
+    thr = max(3 * np.median(m), 0.3 * np.percentile(m, 99.5))
+    mask = (m > thr).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask)
+    if n < 2:
+        return None, m
+    k = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    if st[k, cv2.CC_STAT_AREA] < 0.01 * mask.size:
+        return None, m
+    x, y, w, h = (int(v) for v in st[k, :4])
+    return (x, y, w, h), m
+
+
 def select_roi(frame):
     print("Выделите участок желоба с текущей жидкостью, Enter - подтвердить")
     r = cv2.selectROI("ROI (Enter)", frame, showCrosshair=False)
@@ -153,7 +195,7 @@ def _match(img, tpl, x0, y0):
     return x0 + fx, y0 + fy, mx
 
 
-def m_piv(prev8, cur8, max_shift, tile=64, min_ncc=0.6):
+def m_piv(prev8, cur8, max_shift, tile=64, min_ncc=0.6, tiles_out=None):
     """Блочное сопоставление: сетка фрагментов prev ищется в cur.
     Грубый поиск на половинном разрешении в окне ±max_shift, затем уточнение ±4 px."""
     H, W = prev8.shape
@@ -180,6 +222,8 @@ def m_piv(prev8, cur8, max_shift, tile=64, min_ncc=0.6):
             fx, fy, ncc = _match(cur8[by0:by1, bx0:bx1], tpl, bx0, by0)
             if ncc >= min_ncc:
                 out.append((fx - x, fy - y))
+                if tiles_out is not None:
+                    tiles_out.append((cy, fx - x, fy - y))
     if len(out) < 3:
         return np.nan, np.nan, len(out)
     d = np.array(out)
@@ -200,28 +244,31 @@ def _xcorr_peak(acc, min_shift=0):
     return s
 
 
-def m_kymo(profiles, max_lag_shift, min_shift=0):
+def m_kymo(runs, max_lag_shift, min_shift=0):
     """
-    profiles: (T, B, W) - профили яркости вдоль желоба, B полос по высоте ROI.
+    runs: список массивов (T, B, W) - непрерывные отрезки кадров (без пропусков),
+    профили яркости вдоль желоба, B полос по высоте ROI.
     Корреляции суммируются по всем кадрам окна и полосам -> устойчиво к
     кадрам без текстуры (они вносят мало энергии).
-    Возвращает сдвиг за 1 кадр (dx).
+    Возвращает сдвиг за 1 шаг кадров (dx).
     """
-    T, B, W = profiles.shape
-    if T < 3:
+    runs = [r for r in runs if len(r) >= 2]
+    if sum(len(r) - 1 for r in runs) < 3:
         return np.nan
+    W = runs[0].shape[2]
     taper = np.hanning(W)
-    F = np.fft.rfft(profiles * taper, axis=2)
+    Fs = [np.fft.rfft(r * taper, axis=2) for r in runs]
+    T = max(len(r) for r in runs)
 
     def shift_for_lag(k):
-        cp = (np.conj(F[:-k]) * F[k:]).sum(axis=(0, 1))
+        cp = sum((np.conj(F[:-k]) * F[k:]).sum(axis=(0, 1)) for F in Fs if len(F) > k)
         cp /= np.abs(cp) + 1e-9 * np.abs(cp).max()      # фазовая (нормированная)
         return _xcorr_peak(np.fft.irfft(cp, n=W), min_shift)
 
     s1 = shift_for_lag(1)
     lags, shifts = [1], [s1]
     k = 2
-    while k < T // 2 and abs(s1) * k < max_lag_shift:
+    while k <= T // 2 and abs(s1) * k < max_lag_shift:
         s = shift_for_lag(k)
         if abs(s - s1 * k) > max(2.0, 0.25 * abs(s1 * k)):
             break  # лаг "перескочил" или текстура распалась
@@ -263,7 +310,7 @@ def robust_stats(v):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", help="видеофайл или папка (берётся самое длинное видео)")
-    ap.add_argument("--roi", help="x,y,w,h в пикселях исходного кадра")
+    ap.add_argument("--roi", help="x,y,w,h в пикселях исходного кадра, или auto (по карте движения)")
     ap.add_argument("--start", type=float, default=0.0, help="начало анализа, с")
     ap.add_argument("--max-seconds", type=float, default=0.0, help="длительность анализа, с (0 = всё)")
     ap.add_argument("--win", type=float, default=1.0, help="окно усреднения, с")
@@ -283,6 +330,9 @@ def main():
                     help="phase/kymo: игнорировать пик корреляции ближе этого сдвига к нулю, px "
                          "(остатки неподвижного фона); 0 = не игнорировать. "
                          "Для очень медленного течения (<3 px/кадр) ставьте 0")
+    ap.add_argument("--frames-csv",
+                    help="метки времени кадров (focus_preview: frames.csv рядом с video.mkv подхватывается сам). "
+                         "Тогда скорость = сдвиг / точный интервал, пары берутся только из соседних кадров камеры")
     ap.add_argument("--out", help="папка результатов")
     a = ap.parse_args()
 
@@ -298,16 +348,49 @@ def main():
         sys.exit("Не удалось прочитать кадр")
     print(f"{os.path.basename(video)}: {frame.shape[1]}x{frame.shape[0]}, {fps:.2f} fps, {nframes} кадров")
 
-    roi = parse_roi(a.roi) if a.roi else select_roi(frame)
-    x, y, w, h = roi
-    print(f"ROI: --roi {x},{y},{w},{h}")
+    fcsv = a.frames_csv or os.path.join(os.path.dirname(os.path.abspath(video)), "frames.csv")
+    TS = None
+    if os.path.isfile(fcsv):
+        with open(fcsv, newline="") as f:
+            rd = list(csv.DictReader(f))
+        TS = np.array([float(r["time_rel_s"]) for r in rd])
+        SEQ = np.array([int(r["driver_seq"]) for r in rd])
+        dseq = np.diff(SEQ)
+        step = int(np.median(dseq)) if dseq.size else 1          # every_n: 2, 5 ...
+        runs_ok = dseq <= step
+        fps = len(TS) / max(TS[-1] - TS[0], 1e-6)                  # средняя частота сохранённых кадров
+        print(f"Метки времени: {fcsv}; кадров {len(TS)}, шаг драйвера {step}, "
+              f"интервал {np.median(np.diff(TS)) * 1000:.2f} мс, разрывов {int((~runs_ok).sum())}, "
+              f"в среднем {fps:.1f} кадр/с")
+        if len(TS) != nframes:
+            print(f"  ВНИМАНИЕ: в видео {nframes} кадров, в frames.csv {len(TS)}")
+
+    def frame_time(i):
+        return TS[i] if TS is not None else i / fps
+
+    def consecutive(i):
+        # пара (i-1, i) - соседние кадры камеры (без разрыва серии)
+        return TS is None or (0 < i < len(TS) and runs_ok[i - 1])
 
     out = a.out or os.path.splitext(video)[0] + "_speed"
     os.makedirs(out, exist_ok=True)
+    if a.roi == "auto":
+        roi, mmap = auto_roi(video, consecutive, nframes, dup_thr=a.dup_thr)
+        if mmap is not None:
+            cv2.imwrite(os.path.join(out, "motion_map.png"),
+                        cv2.normalize(mmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+        if roi is None:
+            sys.exit("Движущаяся область не найдена (потока в кадре нет?)")
+        print("ROI выбран автоматически по карте движения")
+    else:
+        roi = parse_roi(a.roi) if a.roi else select_roi(frame)
+    x, y, w, h = roi
+    print(f"ROI: --roi {x},{y},{w},{h}")
     vis = frame.copy()
     cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
     cv2.imwrite(os.path.join(out, "roi.png"), vis)
 
+    i0 = int(round(cap.get(cv2.CAP_PROP_POS_FRAMES))) - 1        # номер кадра `frame`
     limit = int(a.max_seconds * fps) if a.max_seconds > 0 else None
     alpha = 1.0 / (a.bg_tau * fps) if a.bg_tau > 0 else 0.0
     hann = cv2.createHanningWindow((w, h), cv2.CV_32F)
@@ -326,26 +409,29 @@ def main():
         def prep(fr):
             g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
             g = cv2.warpAffine(g, A, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                               borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
             g = cv2.GaussianBlur(g, (0, 0), 1.0)
             return g * (100.0 / (g.mean() + 1e-3))     # нормировка яркости (автоэкспозиция)
         return prep
 
     def is_dup(g, g_last):
-        return float(np.abs(g - g_last).mean()) < a.dup_thr
+        return TS is None and float(np.abs(g - g_last).mean()) < a.dup_thr
 
     if a.angle is None:
         # предварительный проход: PIV по первым уникальным кадрам без поворота,
         # фон = временная медиана этих кадров (убирает неподвижные края)
         prep0 = make_prep(0.0)
         pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        last, uniq = prep0(frame), []
+        last, uniq, cons = prep0(frame), [], []
+        j = i0
         for _ in range(int(fps * 10)):
             ok, fr = cap.read()
+            j += 1
             if not ok or len(uniq) >= 40:
                 break
             g = prep0(fr)
             if not is_dup(g, last):
+                cons.append(len(uniq) > 0 and consecutive(j))
                 uniq.append(g)
                 last = g
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
@@ -354,31 +440,48 @@ def main():
             bg0 = np.median(np.array(uniq), axis=0)
             sc = 40.0 / (np.std(uniq[0] - bg0) + 1e-3)
             u8 = [to_u8(g - bg0, sc) for g in uniq]
-            for p8, c8 in zip(u8[:-1], u8[1:]):
-                dx, dy, n = m_piv(p8, c8, max_shift)
+            for k in range(1, len(u8)):
+                if not cons[k]:
+                    continue
+                dx, dy, n = m_piv(u8[k - 1], u8[k], max_shift)
                 if n >= 5:
                     est.append((dx, dy))
         if len(est) < 5:
             sys.exit("Не удалось оценить направление течения, задайте --angle")
         e = np.median(np.array(est), axis=0)
         a.angle = float(np.degrees(np.arctan2(-e[1], -e[0])))
-        print(f"Направление течения (авто): {a.angle:+.1f}°, сдвиг ~{np.hypot(*e):.1f} px/уник.кадр")
+        print(f"Направление течения (авто): {a.angle:+.1f}°, сдвиг ~{np.hypot(*e):.1f} px/кадр")
     prep = make_prep(a.angle)
     cv2.imwrite(os.path.join(out, "roi_rotated.png"), prep(frame).clip(0, 255).astype(np.uint8))
 
     # Анализируются только "уникальные" кадры: дубликаты (картинка не обновилась)
     # пропускаются, иначе пара "кадр-дубликат" даёт нулевое смещение.
     g_last = prep(frame)
-    bg = g_last.copy()
+    # начальный фон - медиана кадров, равномерно взятых по анализируемому участку
+    # (движущаяся текстура усредняется, неподвижное остаётся); прогрев EMA не нужен
+    pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+    last_f = min(nframes, i0 + limit) if limit else nframes
+    smp = []
+    for j in np.linspace(i0, max(i0, last_f - 1), 41).astype(int):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, j)
+        ok, fr = cap.read()
+        if ok:
+            smp.append(prep(fr))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+    bg = np.median(np.array(smp), axis=0) if len(smp) >= 9 else g_last.copy()
+    warm = 0 if len(smp) >= 9 else a.bg_tau * fps * 0.8
     hp_prev, prev8, scale = None, None, None
     rows, profiles = [], []
-    i, ndup, nuniq = 0, 0, 0
-    t0 = a.start
+    prof_acc = {}                      # поперечная координата -> скорости фрагментов PIV
+    i, ndup, nuniq, nbreak = 0, 0, 0, 0
     while True:
         ok, fr = cap.read()
         if not ok or (limit is not None and i >= limit):
             break
         i += 1
+        fi = i0 + i                     # номер кадра в видео
+        if TS is not None and fi >= len(TS):
+            break
         g = prep(fr)
         if is_dup(g, g_last):
             ndup += 1
@@ -390,25 +493,31 @@ def main():
             hp = g - bg
         else:
             hp = g - g.mean()
-        t = t0 + i / fps
-        if nuniq < a.bg_tau * fps * 0.8:  # фон ещё не установился
+        t = frame_time(fi)
+        if nuniq < warm:                  # фон ещё не установился
             bg += 4 * alpha * (g - bg)
             continue
         if scale is None:
             scale = 40.0 / (hp.std() + 1e-3)
         cur8 = to_u8(hp, scale)
-        profiles.append((t, [hp[band_edges[b]:band_edges[b + 1]].mean(axis=0) for b in range(a.bands)]))
-        if hp_prev is None:
-            hp_prev, prev8 = hp, cur8
+        linked = hp_prev is not None and consecutive(fi)
+        profiles.append((t, linked, [hp[band_edges[b]:band_edges[b + 1]].mean(axis=0) for b in range(a.bands)]))
+        if not linked:
+            nbreak += hp_prev is not None
+            hp_prev, prev8, t_prev = hp, cur8, t
             continue
+        dt = t - t_prev if TS is not None else np.nan
 
         pdx, pdy, presp = m_phase(hp_prev, hp, hann, a.min_shift)
-        vdx, vdy, vn = m_piv(prev8, cur8, max_shift)
+        tiles = []
+        vdx, vdy, vn = m_piv(prev8, cur8, max_shift, tiles_out=tiles)
+        for cy, tdx, tdy in tiles:
+            prof_acc.setdefault(cy, []).append((t, -tdx / dt if TS is not None else -tdx))
         gm = np.hypot(cv2.Sobel(hp, cv2.CV_32F, 1, 0), cv2.Sobel(hp, cv2.CV_32F, 0, 1))
         fdx, fdy = m_farneback(prev8, cur8, gm > np.percentile(gm, 70))
         ldx, ldy, ln = m_lk(prev8, cur8)
-        rows.append([i, t, pdx, pdy, presp, fdx, fdy, ldx, ldy, ln, float(hp.std()), vdx, vdy, vn])
-        hp_prev, prev8 = hp, cur8
+        rows.append([fi, t, pdx, pdy, presp, fdx, fdy, ldx, ldy, ln, float(hp.std()), vdx, vdy, vn, dt])
+        hp_prev, prev8, t_prev = hp, cur8, t
         if len(rows) % int(fps * 5) == 0:
             print(f"  {t:6.1f} с  piv={vdx:7.2f},{vdy:6.2f} lk={ldx:7.2f},{ldy:6.2f} px/кадр")
     cap.release()
@@ -417,7 +526,7 @@ def main():
 
     R = np.array(rows, float)
     cols = ["frame", "t", "phase_dx", "phase_dy", "phase_resp", "farn_dx", "farn_dy",
-            "lk_dx", "lk_dy", "lk_n", "texture", "piv_dx", "piv_dy", "piv_n"]
+            "lk_dx", "lk_dy", "lk_n", "texture", "piv_dx", "piv_dy", "piv_n", "dt"]
     with open(os.path.join(out, "frames.csv"), "w", newline="") as f:
         wr = csv.writer(f)
         wr.writerow(cols)
@@ -448,9 +557,12 @@ def main():
         "lk": across(R[:, 7], R[:, 8]),
     }
 
-    # окна по времени: скорость = медианный сдвиг за уникальный кадр * число уникальных кадров в секунду
+    # окна по времени. С метками времени: скорость пары = сдвиг / dt.
+    # Без них (запись экрана): сдвиг за уникальный кадр * число уникальных кадров в секунду.
     tp = np.array([p[0] for p in profiles])
-    P = np.array([p[1] for p in profiles], np.float32)
+    lp = np.array([p[1] for p in profiles])
+    P = np.array([p[2] for p in profiles], np.float32)
+    DT = R[:, 14]
     edges = np.arange(tp[0], tp[-1] + 1e-9, a.win)
     wins = {m: [] for m in METHODS}
     wt, wrate = [], []
@@ -461,12 +573,29 @@ def main():
         rate = n / a.win
         wt.append(edges[k] + a.win / 2)
         wrate.append(rate)
+        npair = int(sel.sum())
         for m in ("piv", "phase", "farn", "lk"):
-            v = per_frame[m][sel]
-            v = v[np.isfinite(v)]
-            wins[m].append(window_mean(v) * rate if v.size >= max(3, 0.3 * n) else np.nan)
-        kdx = m_kymo(P[psel], max_lag_shift=w / 3, min_shift=a.min_shift) if n >= 6 else np.nan
-        wins["kymo"].append(-kdx * rate)
+            v = per_frame[m][sel] / DT[sel] if TS is not None else per_frame[m][sel]
+            ok_v = np.isfinite(v)
+            if ok_v.sum() >= max(3, 0.3 * npair):
+                wins[m].append(window_mean(v) if TS is not None else window_mean(v) * rate)
+            else:
+                wins[m].append(np.nan)
+        idx = np.flatnonzero(psel)
+        runs, cur = [], []
+        for j in idx:
+            if not lp[j] and cur:
+                runs.append(np.array(cur))
+                cur = []
+            cur.append(P[j])
+        if cur:
+            runs.append(np.array(cur))
+        kdx = m_kymo(runs, max_lag_shift=w / 3, min_shift=a.min_shift) if n >= 6 else np.nan
+        if TS is not None:
+            dts = DT[sel]
+            wins["kymo"].append(-kdx / np.median(dts) if dts.size else np.nan)
+        else:
+            wins["kymo"].append(-kdx * rate)
     wt = np.array(wt)
     wrate = np.array(wrate)
     for m in METHODS:
@@ -495,8 +624,11 @@ def main():
                         + [f"{q * k_cam:.2f}" for q in v] + [f"{wcons[k]:.2f}", f"{wspread[k]:.1f}"])
 
     lines = [f"Видео: {video}",
-             f"FPS записи: {fps:.3f}; кадров: {i}, из них дубликатов {ndup} ({ndup / max(i, 1) * 100:.0f}%); "
-             f"уникальных в секунду (медиана по окнам): {np.median(wrate):.1f}",
+             (f"Метки времени: {fcsv}; пар соседних кадров: {len(R)}, разрывов серий: {nbreak}, "
+              f"интервал пары (медиана): {np.nanmedian(DT) * 1000:.2f} мс"
+              if TS is not None else
+              f"FPS записи: {fps:.3f}; кадров: {i}, из них дубликатов {ndup} ({ndup / max(i, 1) * 100:.0f}%); "
+              f"уникальных в секунду (медиана по окнам): {np.median(wrate):.1f}"),
              f"ROI: {x},{y},{w},{h}; окно {a.win:g} с",
              f"Направление течения: {a.angle:+.1f}° от горизонтали (0 = налево, + = вверх-влево); "
              f"остаточный угол после поворота (PIV): {resid:+.1f}°", ""]
@@ -525,6 +657,27 @@ def main():
                   + (f" = {cons * k_cam:.1f} px/с камеры" if a.display_scale != 1 else ""),
                   f"Расхождение согласованных методов (max-min): {spread:.1f} px/с "
                   f"({spread / abs(cons) * 100:.1f}%)"]
+    # профиль скорости поперёк потока (PIV по полосам фрагментов)
+    conv_p = 1.0 if TS is not None else float(np.median(wrate))
+    prof = []
+    nmax = max((len(v) for v in prof_acc.values()), default=0)
+    for cy in sorted(prof_acc):
+        v = np.array([q[1] for q in prof_acc[cy]]) * conv_p
+        if len(v) >= max(30, 0.5 * nmax):   # краевые полосы с редкой текстурой не берём
+            prof.append((cy, len(v), window_mean(v), float(np.percentile(v, 25)), float(np.percentile(v, 75))))
+    with open(os.path.join(out, "profile.csv"), "w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["y_rot_px", "n", "px_per_s", "p25", "p75"])
+        wr.writerows(prof)
+    if prof:
+        pv = np.array([q[2] for q in prof])
+        lines += ["", "Профиль скорости поперёк потока (PIV; y - координата поперёк течения в повёрнутом ROI):"]
+        lines += [f"  y={q[0]:4d}  n={q[1]:6d}  {q[2]:8.1f} px/с  (P25..P75 {q[3]:.0f}..{q[4]:.0f})" for q in prof]
+        lines += [f"  максимум по профилю (ядро потока): {pv.max():.1f} px/с"
+                  + (f" = {pv.max() * k_cam:.1f} px/с камеры" if a.display_scale != 1 else ""),
+                  f"  среднее по видимой ширине потока:  {pv.mean():.1f} px/с"
+                  + (f" = {pv.mean() * k_cam:.1f} px/с камеры" if a.display_scale != 1 else ""),
+                  f"  неравномерность (мин/макс): {pv.min() / pv.max():.2f}"]
     good_w = np.isfinite(wspread) & (wspread <= 10)
     sc = robust_stats(wcons[good_w])
     lines += ["", f"Окна, где согласованные методы расходятся <=10%: {int(good_w.sum())} из {len(wt)}",
@@ -532,7 +685,7 @@ def main():
               + (f" ({sc['median'] * k_cam:.1f} px/с камеры)" if a.display_scale != 1 else "")
               + f", разброс между окнами (MAD) {sc['mad']:.1f} px/с = {sc['cv'] * 100:.1f}%, "
               f"P10..P90 {sc['p10']:.0f}..{sc['p90']:.0f}"]
-    lines.append("Поперечная составляющая (piv/phase/farn/lk), px/уник.кадр: "
+    lines.append("Поперечная составляющая (piv/phase/farn/lk), px/кадр: "
                  + " / ".join(f"{np.nanmedian(cross[m]):.3f}" if np.isfinite(cross[m]).any() else "nan"
                               for m in ("piv", "phase", "farn", "lk"))
                  + "  (должна быть ~0)")
@@ -547,9 +700,9 @@ def main():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-        rate_med = float(np.median(wrate))
+        conv = 1.0 / DT if TS is not None else float(np.median(wrate))
         for m in ("piv", "phase", "farn", "lk"):
-            ax[0].plot(R[:, 1], per_frame[m] * rate_med, ".", ms=2, alpha=0.4, label=m)
+            ax[0].plot(R[:, 1], per_frame[m] * conv, ".", ms=2, alpha=0.4, label=m)
         ax[0].set_ylabel("по кадрам, px/с")
         ax[0].legend(markerscale=5)
         for m in METHODS:
