@@ -163,6 +163,16 @@ def main():
 
     P = gutter(a.profile)
     z = level_from_half_width(P, b, a.side)
+    if not np.isfinite(z):
+        txt = (f"Результат скорости: {a.speed_dir}\n"
+               f"Видимая полуширина поверхности: {d_px:.0f} px = {d_px * a.scale_normal:.0f} мм; "
+               f"с коркой {a.crust:g} мм: b = {b:.0f} мм\n"
+               f"Уровень: не определён - b больше максимальной полуширины профиля "
+               f"({np.abs(P[:, 0]).max():.0f} мм); край или ось найдены неверно")
+        print(txt)
+        with open(os.path.join(a.speed_dir, "flow_rate.txt"), "w", encoding="utf-8") as f:
+            f.write(txt + "\n")
+        sys.exit(1)
     xs = np.linspace(P[:, 0].min(), P[:, 0].max(), 4000)
     zb = np.interp(xs, P[:, 0], P[:, 1])
     dep = np.clip(z - zb, 0, None) / 1000.0                    # м

@@ -81,6 +81,8 @@ def collect(res_dir, data_dir):
         flags.append("методы расходятся >20%")
     if not fr:
         flags.append("нет расчёта уровня")
+    elif not np.isfinite(r["уровень_мм"]):
+        flags.append("уровень не определён")
     r["оценка"] = "надёжно" if not flags else "; ".join(flags)
     r["_t"] = t0
     return r
