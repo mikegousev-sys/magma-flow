@@ -11,3 +11,7 @@ code/magma_vision_client
 *.raw
 *.log
 /tmp/
+
+# Python
+__pycache__/
+*.pyc
