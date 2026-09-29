@@ -55,18 +55,17 @@ def gutter(path):
 
 
 def half_width(P, z, side):
-    """Полуширина сечения на уровне z (от оси до стенки) для side=+1 (правая) / -1 (левая)."""
+    """Полуширина сечения на уровне z (скаляр или массив; от оси до стенки)
+    для side=+1 (правая) / -1 (левая)."""
     s = P[P[:, 0] * side > 0]
     s = s[np.argsort(s[:, 1])]
-    # на каждом уровне берём самую дальнюю от оси точку профиля
-    zz = np.maximum.accumulate(s[:, 1])
-    return float(np.interp(z, zz, np.abs(s[:, 0])))
+    return np.interp(z, s[:, 1], np.abs(s[:, 0]))
 
 
 def level_from_half_width(P, b, side):
     zs = np.linspace(0, P[:, 1].max(), 2000)
-    hw = np.array([half_width(P, z, side) for z in zs])
-    hw = np.maximum.accumulate(hw)
+    # на каждом уровне - самая дальняя от оси точка профиля ниже него
+    hw = np.maximum.accumulate(half_width(P, zs, side))
     if b > hw[-1]:
         return np.nan
     return float(np.interp(b, hw, zs))
@@ -94,10 +93,12 @@ def main():
     # ось потока: вершина параболы вокруг максимума профиля скорости
     i = int(np.argmax(vp))
     if 0 < i < len(vp) - 1:
-        y0, y1, y2 = vp[i - 1:i + 2]
-        den = y0 - 2 * y1 + y2
-        off = 0.5 * (y0 - y2) / den if den != 0 else 0.0
-        n_axis = n_prof[i] + off * (n_prof[1] - n_prof[0])
+        # вершина параболы по 3 точкам; шаг может быть неравномерным (полосы с редкой
+        # текстурой flow_speed выбрасывает из profile.csv)
+        (x0, x1, x2), (y0, y1, y2) = n_prof[i - 1:i + 2], vp[i - 1:i + 2]
+        num_ = (x1 - x0) ** 2 * (y1 - y2) - (x1 - x2) ** 2 * (y1 - y0)
+        den = (x1 - x0) * (y1 - y2) - (x1 - x2) * (y1 - y0)
+        n_axis = x1 - 0.5 * num_ / den if den != 0 else x1
         axis_note = ""
     else:
         n_axis = n_prof[i]
@@ -114,25 +115,36 @@ def main():
                   [e1[1], e2[1], cy0 - e1[1] * W / 2 - e2[1] * H / 2]], np.float32)
     cap = cv2.VideoCapture(a.video)
     nfr = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    lo, hi = 0, nfr
+    # участок [lo, hi) - так же, как в flow_speed: по меткам времени или по FPS
     fcsv = os.path.join(os.path.dirname(os.path.abspath(a.video)), "frames.csv")
     if os.path.isfile(fcsv):
-        ts = np.array([float(r["time_rel_s"]) for r in csv.DictReader(open(fcsv))])
+        with open(fcsv, newline="") as fh:
+            ts = np.array([float(r["time_rel_s"]) for r in csv.DictReader(fh)])
         lo = int(np.searchsorted(ts, ts[0] + a.start))
         hi = int(np.searchsorted(ts, ts[0] + a.start + a.seconds)) if a.seconds > 0 else len(ts)
-        hi = min(hi, nfr)
+    else:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        if fps <= 0 and (a.start > 0 or a.seconds > 0):
+            sys.exit("Не удалось определить FPS для --start/--seconds")
+        lo = int(a.start * fps)
+        hi = int((a.start + a.seconds) * fps) if a.seconds > 0 else nfr
+    hi = min(hi, nfr)
+    if hi <= lo:
+        sys.exit(f"Пустой участок кадров {lo}..{hi} (в видео {nfr})")
     frames, valid = [], None
-    for j in np.linspace(lo, hi - 1, 60).astype(int):
+    for j in np.unique(np.linspace(lo, hi - 1, 60).astype(int)):
         cap.set(cv2.CAP_PROP_POS_FRAMES, j)
         ok, f = cap.read()
         if not ok:
             continue
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)          # uint8: 60 кадров 1600x1600 без float-копий
         if valid is None:
             valid = cv2.warpAffine(np.ones_like(g), A, (W, H),
                                    flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP) > 0
         frames.append(cv2.warpAffine(g, A, (W, H), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP))
     cap.release()
+    if not frames:
+        sys.exit(f"Не удалось прочитать кадры {lo}..{hi - 1} из {a.video}")
     med = np.median(np.array(frames), axis=0)
     Y_axis = int(round(H / 2 + n_axis))
     edges = []
@@ -161,31 +173,47 @@ def main():
     d_px = abs(n_axis - n_edge)
     b = d_px * a.scale_normal + a.crust
 
-    P = gutter(a.profile)
-    z = level_from_half_width(P, b, a.side)
-    if not np.isfinite(z):
-        txt = (f"Результат скорости: {a.speed_dir}\n"
-               f"Видимая полуширина поверхности: {d_px:.0f} px = {d_px * a.scale_normal:.0f} мм; "
-               f"с коркой {a.crust:g} мм: b = {b:.0f} мм\n"
-               f"Уровень: не определён - b больше максимальной полуширины профиля "
-               f"({np.abs(P[:, 0]).max():.0f} мм); край или ось найдены неверно")
+    # скорость поверхности как функция расстояния от оси, м/с (от уровня не зависит)
+    r_prof = np.abs(n_prof - n_axis) * a.scale_normal          # мм
+    u_prof = vp * a.scale_along / 1000.0
+    order = np.argsort(r_prof)
+    r_s, u_s = r_prof[order], u_prof[order]
+    r_vis = abs(n_edge - n_axis) * a.scale_normal
+
+    head = [
+        f"Результат скорости: {a.speed_dir}",
+        f"ROI {x},{y},{w},{h}, направление {ang:+.1f}°",
+        f"Ось потока (максимум скорости): n = {n_axis:+.1f} px{axis_note}",
+        f"Край корки A: n = {n_edge:+.1f} px (разброс по длине P10..P90 {np.percentile(edges, 10):+.0f}..{np.percentile(edges, 90):+.0f})",
+        f"Видимая полуширина поверхности: {d_px:.0f} px = {d_px * a.scale_normal:.0f} мм; с коркой {a.crust:g} мм: b = {b:.0f} мм",
+    ]
+    speed_line = f"Скорость поверхности на оси: {u_prof.max():.2f} м/с; видимый край на {r_vis:.0f} мм от оси"
+
+    def write_out(lines):
+        txt = "\n".join(lines)
         print(txt)
         with open(os.path.join(a.speed_dir, "flow_rate.txt"), "w", encoding="utf-8") as f:
             f.write(txt + "\n")
+        vis = cv2.cvtColor(cv2.normalize(med, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        for nn, col in ((n_axis, (0, 200, 0)), (n_edge, (0, 0, 255))):
+            cv2.line(vis, (0, int(H / 2 + nn)), (W - 1, int(H / 2 + nn)), col, 2)
+        cv2.imwrite(os.path.join(a.speed_dir, "level_check.png"), vis[::2, ::2])
+
+    P = gutter(a.profile)
+    prof_name = os.path.splitext(os.path.basename(a.profile))[0]
+    z = level_from_half_width(P, b, a.side)
+    if not np.isfinite(z):
+        # скорость, ось и край всё равно пишем: по ним collect_metrics ставит оценку
+        write_out(head + [f"Уровень: не определён - b больше максимальной полуширины профиля {prof_name} "
+                          f"({np.abs(P[:, 0]).max():.0f} мм); край или ось найдены неверно",
+                          speed_line])
         sys.exit(1)
     xs = np.linspace(P[:, 0].min(), P[:, 0].max(), 4000)
     zb = np.interp(xs, P[:, 0], P[:, 1])
     dep = np.clip(z - zb, 0, None) / 1000.0                    # м
     area = float(np.trapezoid(dep, xs / 1000.0))
     wet = dep > 0
-    bL, bR = -xs[wet].min(), xs[wet].max()
-
-    # скорость поверхности как функция расстояния от оси, м/с
-    r_prof = np.abs(n_prof - n_axis) * a.scale_normal          # мм
-    u_prof = vp * a.scale_along / 1000.0
-    order = np.argsort(r_prof)
-    r_s, u_s = r_prof[order], u_prof[order]
-    r_vis = abs(n_edge - n_axis) * a.scale_normal
+    bL, bR = (-xs[wet].min(), xs[wet].max()) if wet.any() else (0.0, 0.0)
 
     def u_at(r, bw):
         r = np.abs(r)
@@ -201,28 +229,14 @@ def main():
     kmin, kmax = (float(v) for v in a.k.split(","))
     u_mean_s = q_surf / area if area > 0 else np.nan
 
-    lines = [
-        f"Результат скорости: {a.speed_dir}",
-        f"ROI {x},{y},{w},{h}, направление {ang:+.1f}°",
-        f"Ось потока (максимум скорости): n = {n_axis:+.1f} px{axis_note}",
-        f"Край корки A: n = {n_edge:+.1f} px (разброс по длине P10..P90 {np.percentile(edges, 10):+.0f}..{np.percentile(edges, 90):+.0f})",
-        f"Видимая полуширина поверхности: {d_px:.0f} px = {d_px * a.scale_normal:.0f} мм; с коркой {a.crust:g} мм: b = {b:.0f} мм",
-        f"Уровень (от низшей точки профиля Б-Б): {z:.0f} мм; смачиваемая ширина {bL:.0f} + {bR:.0f} мм",
+    write_out(head + [
+        f"Уровень (от низшей точки профиля {prof_name}): {z:.0f} мм; смачиваемая ширина {bL:.0f} + {bR:.0f} мм",
         f"Площадь живого сечения: {area * 1e4:.0f} см²",
-        f"Скорость поверхности на оси: {u_prof.max():.2f} м/с; видимый край на {r_vis:.0f} мм от оси",
+        speed_line,
         f"Средняя по сечению скорость поверхности (взвешенная по глубине): {u_mean_s:.2f} м/с",
         f"Расход при k = {kmin:g}..{kmax:g}: {q_surf * kmin * 1000:.1f}..{q_surf * kmax * 1000:.1f} л/с"
         f" = {q_surf * kmin * a.rho * 3.6:.0f}..{q_surf * kmax * a.rho * 3.6:.0f} т/ч (ρ = {a.rho:g} кг/м³)",
-    ]
-    txt = "\n".join(lines)
-    print(txt)
-    with open(os.path.join(a.speed_dir, "flow_rate.txt"), "w", encoding="utf-8") as f:
-        f.write(txt + "\n")
-    vis = cv2.cvtColor(cv2.normalize(med, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-    for nn, col in ((n_axis, (0, 200, 0)), (n_edge, (0, 0, 255))):
-        cv2.line(vis, (0, int(H / 2 + nn)), (W - 1, int(H / 2 + nn)), col, 2)
-    cv2.imwrite(os.path.join(a.speed_dir, "level_check.png"), vis[::2, ::2])
-
+    ])
 
 if __name__ == "__main__":
     main()

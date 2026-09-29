@@ -28,7 +28,12 @@ def num(pat, txt, cast=float, default=np.nan):
 def collect(res_dir, data_dir):
     name = os.path.basename(res_dir.rstrip("/"))
     m = re.match(r"(rec_\d{8}-\d{6}_[a-z0-9_]+?)(?:_(\d+))?$", name)
-    rec, seg = (m.group(1), int(m.group(2))) if m and m.group(2) else (name, None)
+    # имя самой записи тоже может кончаться на _<число> (режим every_5 ...):
+    # отрезком считаем суффикс, только если папки записи с полным именем нет
+    if m and m.group(2) and not os.path.isdir(os.path.join(data_dir, name)):
+        rec, seg = m.group(1), int(m.group(2))
+    else:
+        rec, seg = name, None
     meta_p = os.path.join(data_dir, rec, "meta.json")
     meta = json.load(open(meta_p)) if os.path.isfile(meta_p) else {}
     summ = open(os.path.join(res_dir, "summary.txt"), encoding="utf-8").read()
@@ -58,7 +63,7 @@ def collect(res_dir, data_dir):
         "v_разброс_окон_%": float(1.4826 * np.median(np.abs(cg - np.median(cg))) / np.median(cg) * 100)
         if cg.size >= 3 else np.nan,
         "расхождение_методов_%": num(r"Расхождение согласованных методов \(max-min\): [\d.]+ px/с \(([\d.]+)%\)", summ),
-        "уровень_мм": num(r"Уровень \(от низшей точки профиля Б-Б\): ([\d.]+)", fr),
+        "уровень_мм": num(r"Уровень \(от низшей точки профиля [^)]*\): ([\d.]+)", fr),
         "площадь_см2": num(r"Площадь живого сечения: ([\d.]+)", fr),
         "Q_мин_л_с": num(r"Расход при k = [\d.]+\.\.[\d.]+: ([\d.]+)\.\.", fr),
         "Q_макс_л_с": num(r"Расход при k = [\d.]+\.\.[\d.]+: [\d.]+\.\.([\d.]+) л/с", fr),
@@ -93,12 +98,15 @@ def main():
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", default="metrics")
+    ap.add_argument("--seg-len", type=float, default=30.0, help="длина отрезка анализа, с (как --max-seconds)")
     a = ap.parse_args()
     res = []
     for d in a.dirs:
         for p in sorted(glob.glob(d)) if any(c in d for c in "*?[") else [d]:
             if os.path.isfile(os.path.join(p, "summary.txt")):
                 res.append(collect(p, a.data))
+    if not res:
+        raise SystemExit("Не найдено ни одной папки с summary.txt")
     res.sort(key=lambda r: (r["_t"] is None, r["_t"]))
     os.makedirs(a.out, exist_ok=True)
     keys = [k for k in res[0] if not k.startswith("_")]
@@ -113,20 +121,24 @@ def main():
     lines = ["| время | запись | отрезок | v на оси, м/с | разброс v, % | уровень, мм | площадь, см² | расход, л/с | т/ч | оценка |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in res:
-        lines.append(f"| {r['время']} | {r['запись']} | {'' if r['отрезок_с'] is None else str(r['отрезок_с']) + '–' + str(r['отрезок_с'] + 30) + ' с'} | {f(r['v_ось_м_с'], '{:.2f}')} | "
+        seg = "" if r["отрезок_с"] is None else f"{r['отрезок_с']}–{r['отрезок_с'] + a.seg_len:g} с"
+        lines.append(f"| {r['время']} | {r['запись']} | {seg} | {f(r['v_ось_м_с'], '{:.2f}')} | "
                      f"{f(r['v_разброс_окон_%'], '{:.1f}')} | {f(r['уровень_мм'], '{:.0f}')} | "
                      f"{f(r['площадь_см2'], '{:.0f}')} | {f(r['Q_мин_л_с'], '{:.0f}')}–{f(r['Q_макс_л_с'], '{:.0f}')} | "
                      f"{f(r['т_ч_мин'], '{:.0f}')}–{f(r['т_ч_макс'], '{:.0f}')} | {r['оценка']} |")
     open(os.path.join(a.out, "metrics.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
     print("\n".join(lines))
 
+    ok = [r for r in res if r["_t"] is not None]
+    if not ok:
+        print("Нет времени начала записей (meta.json) - график не построен")
+        return
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        ok = [r for r in res if r["_t"] is not None]
         t = [r["_t"] for r in ok]
-        good = np.array([r["оценка"] == "надёжно" for r in ok])
+        good = np.array([r["оценка"] == "надёжно" for r in ok], bool)
         fig, ax = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
         for i, (key, lab) in enumerate((("v_ось_м_с", "скорость на оси, м/с"), ("уровень_мм", "уровень, мм"))):
             v = np.array([r[key] for r in ok], float)
