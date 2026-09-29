@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <vector>
@@ -51,6 +52,12 @@ struct GrayImage {
     bool Valid() const { return data != nullptr && width > 1 && height > 1; }
 
     std::size_t Stride() const { return stride > 0 ? stride : width; }
+
+    /// Точка внутри кадра (там, где Sample интерполирует, а не возвращает 0).
+    bool Contains(double x, double y) const {
+        return x >= 0.0 && y >= 0.0 && x < static_cast<double>(width - 1) &&
+               y < static_cast<double>(height - 1);
+    }
 
     /// Значение в дробных координатах (билинейная интерполяция).
     /// Нужна потому, что полоса проводится под произвольным углом и почти
@@ -106,6 +113,10 @@ struct EdgeConfig {
     std::size_t smooth_radius = 3;
     /// Минимальный градиент, при котором кромка считается найденной.
     double min_gradient = 3.0;
+    /// Относительный порог: градиент кромки должен превышать шум градиента
+    /// профиля (1.4826·MAD) во столько раз. Абсолютный min_gradient зависит
+    /// от засветки и контраста корки; относительный — нет. 0 — не применять.
+    double min_gradient_noise = 0.0;
     /// Доля профиля с каждого края, где кромки не ищутся: там полоса может
     /// выходить за пределы жёлоба или кадра.
     double margin_fraction = 0.05;
@@ -145,10 +156,15 @@ public:
                     : 0.0;
                 const double x = strip.center_x_px + ax * offset + lx * t;
                 const double y = strip.center_y_px + ay * offset + ly * t;
+                // Точки за кадром не усредняются: Sample вернул бы там 0, и
+                // граница кадра выглядела бы как самая резкая кромка профиля.
+                if (!image.Contains(x, y)) continue;
                 sum += image.Sample(x, y);
                 ++count;
             }
-            profile[i] = count > 0 ? sum / static_cast<double>(count) : 0.0;
+            // Отсчёт целиком за кадром помечается NaN — FindEdges его не использует.
+            profile[i] = count > 0 ? sum / static_cast<double>(count)
+                                   : std::numeric_limits<double>::quiet_NaN();
         }
         return profile;
     }
@@ -158,9 +174,24 @@ public:
     /// Координаты возвращаются в отсчётах профиля. Перевод в миллиметры
     /// выполняется снаружи через калибровку, поскольку здесь неизвестен
     /// шаг полосы в мировых единицах.
-    EdgeObservation FindEdges(const std::vector<double>& profile) const {
+    EdgeObservation FindEdges(const std::vector<double>& full_profile) const {
         EdgeObservation observation;
-        if (profile.size() < 16) return observation;
+
+        // Работаем только с видимой частью полосы — самым длинным отрезком
+        // отсчётов внутри кадра. Координаты кромок возвращаются в отсчётах
+        // полного профиля, поэтому к ним прибавляется начало отрезка.
+        std::size_t first = 0, length = 0;
+        for (std::size_t i = 0; i < full_profile.size();) {
+            if (!std::isfinite(full_profile[i])) { ++i; continue; }
+            std::size_t j = i;
+            while (j < full_profile.size() && std::isfinite(full_profile[j])) ++j;
+            if (j - i > length) { first = i; length = j - i; }
+            i = j;
+        }
+        if (length < 16) return observation;
+        const std::vector<double> profile(full_profile.begin() + first,
+                                          full_profile.begin() + first + length);
+        const double origin = static_cast<double>(first);
 
         observation.brightness =
             std::accumulate(profile.begin(), profile.end(), 0.0) /
@@ -184,16 +215,17 @@ public:
         // Спад обязан идти ПОСЛЕ подъёма: иначе это не полоса расплава,
         // а посторонний перепад (блик, край кадра, тень).
         const bool ordered = fall > rise + config_.min_separation;
+        const double threshold = Threshold(gradient, margin);
 
-        if (best_rise >= config_.min_gradient && ordered) {
+        if (best_rise >= threshold && ordered) {
             observation.near_px =
-                static_cast<double>(rise) + Parabolic(gradient, rise);
+                origin + static_cast<double>(rise) + Parabolic(gradient, rise);
             observation.near_sharpness = best_rise;
             observation.near_found = true;
         }
-        if (best_fall >= config_.min_gradient && ordered) {
+        if (best_fall >= threshold && ordered) {
             observation.far_px =
-                static_cast<double>(fall) + Parabolic(gradient, fall, true);
+                origin + static_cast<double>(fall) + Parabolic(gradient, fall, true);
             observation.far_sharpness = best_fall;
             observation.far_found = true;
         }
@@ -206,6 +238,22 @@ public:
     }
 
 private:
+    /// Порог кромки: абсолютный min_gradient и, если задан, относительный —
+    /// кратный шуму градиента (1.4826·MAD по области поиска).
+    double Threshold(const std::vector<double>& gradient, std::size_t margin) const {
+        if (config_.min_gradient_noise <= 0.0) return config_.min_gradient;
+        std::vector<double> values(gradient.begin() + static_cast<std::ptrdiff_t>(margin),
+                                   gradient.end() - static_cast<std::ptrdiff_t>(margin));
+        auto median = [](std::vector<double>& v) {
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+            return v[v.size() / 2];
+        };
+        const double center = median(values);
+        for (double& value : values) value = std::fabs(value - center);
+        const double noise = 1.4826 * median(values);
+        return std::max(config_.min_gradient, config_.min_gradient_noise * noise);
+    }
+
     /// Скользящее среднее. Простое усреднение предпочтено гауссову: при
     /// небольшом радиусе разница в результате незначительна, а стоимость
     /// заметно ниже — профиль обрабатывается для каждого кадра серии.

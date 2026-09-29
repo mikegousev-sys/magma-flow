@@ -40,6 +40,7 @@
 #include <thread>
 #include <vector>
 
+#include "magma_axis_level.hpp"
 #include "magma_broadcast.hpp"
 #include "magma_capture.hpp"
 #include "magma_config.hpp"
@@ -229,6 +230,7 @@ private:
     void ApplyGeometryAndThresholds() {
         geometry_.channel_radius_mm = config_.GetDouble("geometry.channel_radius_mm", 150.0);
         geometry_.max_level_mm = config_.GetDouble("geometry.max_level_mm", 105.0);
+        geometry_.wall_angle_deg = config_.GetDouble("geometry.wall_angle_deg", 0.0);
 
         level_config_.min_sharpness = config_.GetDouble("level.min_sharpness", 5.0);
         level_config_.melt_present_brightness =
@@ -239,8 +241,27 @@ private:
             config_.GetDouble("level.systematic_sigma_mm", 0.5);
         center_reference_px_ = config_.GetDouble("level.center_reference_px", 0.0);
 
+        // Способ измерения уровня: "edges" — две кромки зеркала в полосе
+        // level.strip.* (участники «ширина» и «центр»); "axis_edge" — ось
+        // потока по полосам скорости и край корки (видна половина жёлоба),
+        // см. magma_axis_level.hpp.
+        level_axis_edge_ = config_.GetString("level.mode", "edges").rfind("axis_edge", 0) == 0;
+        axis_config_.bands = config_.GetSize("level.axis.bands", 8);
+        axis_config_.width_px = config_.GetDouble("level.axis.width_px", 0.0);
+        axis_config_.band_lines = config_.GetSize("level.axis.band_lines", 5);
+        axis_config_.edge_length_px = config_.GetDouble("level.axis.edge_length_px", 800.0);
+        axis_config_.edge_step_px = config_.GetDouble("level.axis.edge_step_px", 2.0);
+        axis_config_.edge_columns = config_.GetSize("level.axis.edge_columns", 64);
+        axis_config_.edge_side = config_.GetInt("level.axis.edge_side", 0);
+        axis_config_.min_contrast = config_.GetDouble("level.axis.min_contrast", 5.0);
+        axis_config_.min_columns = config_.GetSize("level.axis.min_columns", 10);
+        axis_config_.scale_across_mm_per_px =
+            config_.GetDouble("level.axis.scale_across_mm_per_px", 0.638);
+        axis_config_.crust_mm = config_.GetDouble("level.axis.crust_mm", 25.0);
+
         edge_config_.smooth_radius = config_.GetSize("edge.smooth_radius", 3);
         edge_config_.min_gradient = config_.GetDouble("edge.min_gradient", 3.0);
+        edge_config_.min_gradient_noise = config_.GetDouble("edge.min_gradient_noise", 0.0);
         edge_config_.margin_fraction = config_.GetDouble("edge.margin_fraction", 0.05);
         edge_config_.min_separation = config_.GetSize("edge.min_separation", 20);
 
@@ -640,6 +661,8 @@ private:
 
         FlowEstimator flow(flow_config_);
         EdgeFinder edges(edge_config_);
+        std::optional<AxisEdgeLevel> axis_level;
+        if (level_axis_edge_) axis_level.emplace(flow_strip_, flow_config_, axis_config_);
 
         std::vector<EdgeObservation> level_observations;
         level_observations.reserve(schedule_.level_frames + 1);
@@ -667,7 +690,9 @@ private:
                 const double timestamp = MonotonicSeconds() - burst_started;
                 flow.AddProfile(ProfileExtractor::Extract(image, flow_strip_), timestamp);
 
-                if (index % level_every == 0) {
+                if (axis_level) {
+                    axis_level->AddFrame(image, timestamp, index % level_every == 0);
+                } else if (index % level_every == 0) {
                     level_observations.push_back(edges.Find(image, level_strip_));
                 }
                 if (!have_stats) {
@@ -701,7 +726,9 @@ private:
         }
 
         const FlowResult flow_result = flow.Estimate();
-        const LevelResult level_result = CombineLevelObservations(level_observations);
+        const LevelResult level_result =
+            axis_level ? axis_level->Estimate(geometry_, level_config_)
+                       : CombineLevelObservations(level_observations);
 
         // Выдержка подстраивается МЕЖДУ сериями, а не внутри: изменение
         // посреди серии дало бы ступеньку яркости между кадрами, а расчёт
@@ -952,6 +979,8 @@ private:
     FlowStrip flow_strip_;
     StripDefinition level_strip_;
     double center_reference_px_ = 0.0;
+    bool level_axis_edge_ = false;
+    AxisEdgeConfig axis_config_;
 
     // калибровка
     CameraCalibration calibration_;

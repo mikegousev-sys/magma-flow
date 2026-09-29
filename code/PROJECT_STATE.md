@@ -27,8 +27,8 @@
 
 **Дополнение — редактируется свободно:**
 `magma_capture.hpp`, `magma_veye.hpp`, `magma_exposure.hpp`, `magma_edge.hpp`,
-`magma_level.hpp`, `magma_flow.hpp`, `magma_config.hpp`, `magma_broadcast.hpp`,
-`magma_vision_protocol.hpp`, `magma_vision.cpp`, `magma_vision_client.cpp`,
+`magma_level.hpp`, `magma_flow.hpp`, `magma_axis_level.hpp`, `magma_config.hpp`,
+`magma_broadcast.hpp`, `magma_vision_protocol.hpp`, `magma_vision.cpp`, `magma_vision_client.cpp`,
 `magma_stereo.hpp`, плюс пример настроек `magma_vision.conf`.
 
 Ключевой архитектурный принцип: **зрение — полностью самостоятельный процесс**,
@@ -38,6 +38,12 @@
 ## 3. Ключевые физические параметры (определены в разговоре)
 
 - Геометрия жёлоба: дуга R150 мм, рабочий максимум уровня 105 мм.
+  Уточнено 2026-09-29: дуга R150 до касания (92.6 мм) + прямые стенки 22.5°
+  от вертикали, край рабочего профиля 135 мм (`geometry.wall_angle_deg`).
+- Установка 2026-09-19: видна половина жёлоба (вторую закрывает стенка), край
+  покрыт рваной коркой (~25 мм на зеркало) → уровень по «оси + краю»
+  (`level.mode = axis_edge`, `magma_axis_level.hpp`); β ≈ 52°, 0.548 мм/px
+  вдоль и 0.638 поперёк потока (сетка на поверхности).
 - Расстояния между фотодиодами вдоль потока: 75, 50, 75 мм (6 баз всего).
 - Камера для скорости/уровня: MV-MIPI-SC130M, глобальный затвор, 1280×1024.
 - Угол камеры к плоскости расплава β ≈ 31° (определён по опорному снимку

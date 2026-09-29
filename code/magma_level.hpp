@@ -39,32 +39,68 @@ namespace magma {
 // 1. ГЕОМЕТРИЯ ЖЁЛОБА
 // =============================================================================
 
-/// Сечение канала — дуга окружности. Уровень отсчитывается от нижней точки.
+/// Сечение канала — дуга окружности, при wall_angle_deg > 0 переходящая по
+/// касательной в прямые стенки, отклонённые от вертикали на этот угол (профиль
+/// «R150 + стенки 22.5°»: касание на уровне R·(1 − sin α)). При wall_angle_deg = 0
+/// — чистая дуга, как было. Уровень отсчитывается от нижней точки.
 struct LauncherGeometry {
     double channel_radius_mm = 150.0;  ///< R150 по чертежу
     double max_level_mm = 105.0;       ///< рабочий максимум
+    double wall_angle_deg = 0.0;       ///< наклон прямых стенок от вертикали
 
-    /// Половина ширины зеркала на уровне h: sqrt(2Rh - h^2).
+    double WallTan() const { return std::tan(wall_angle_deg * M_PI / 180.0); }
+    /// Уровень касания дуги и прямой стенки.
+    double TangentLevel() const {
+        return channel_radius_mm * (1.0 - std::sin(wall_angle_deg * M_PI / 180.0));
+    }
+    bool HasWalls() const { return wall_angle_deg > 0.0; }
+
+    /// Половина ширины зеркала на уровне h: sqrt(2Rh - h^2) на дуге, выше
+    /// касания — линейно по стенке.
     double HalfWidth(double level_mm) const {
-        const double h = std::clamp(level_mm, 0.0, 2.0 * channel_radius_mm);
-        const double value = 2.0 * channel_radius_mm * h - h * h;
-        return value > 0.0 ? std::sqrt(value) : 0.0;
+        if (HasWalls() && level_mm > TangentLevel()) {
+            const double t = TangentLevel();
+            return ArcHalfWidth(t) + (level_mm - t) * WallTan();
+        }
+        return ArcHalfWidth(level_mm);
     }
 
     /// Производная полуширины по уровню — чувствительность ширинного участника.
-    /// У поверхности стремится к нулю: стенка там почти вертикальна.
+    /// На дуге у поверхности стремится к нулю: стенка там почти вертикальна.
     double HalfWidthSlope(double level_mm) const {
-        const double w = HalfWidth(level_mm);
+        if (HasWalls() && level_mm > TangentLevel()) return WallTan();
+        const double w = ArcHalfWidth(level_mm);
         if (w < 1e-6) return 0.0;
         return (channel_radius_mm - level_mm) / w;
     }
 
     /// Уровень по известной ширине зеркала (обратная задача).
     std::optional<double> LevelFromWidth(double width_mm) const {
-        const double half = width_mm / 2.0;
-        if (half < 0.0 || half > channel_radius_mm) return std::nullopt;
+        return LevelFromHalfWidth(width_mm / 2.0);
+    }
+
+    /// Уровень по полуширине (от оси до стенки).
+    std::optional<double> LevelFromHalfWidth(double half) const {
+        if (half < 0.0) return std::nullopt;
+        if (HasWalls()) {
+            const double t = TangentLevel();
+            const double half_t = ArcHalfWidth(t);
+            if (half > half_t) {
+                const double tan_a = WallTan();
+                if (tan_a < 1e-12) return std::nullopt;
+                return t + (half - half_t) / tan_a;
+            }
+        }
+        if (half > channel_radius_mm) return std::nullopt;
         return channel_radius_mm -
                std::sqrt(channel_radius_mm * channel_radius_mm - half * half);
+    }
+
+private:
+    double ArcHalfWidth(double level_mm) const {
+        const double h = std::clamp(level_mm, 0.0, 2.0 * channel_radius_mm);
+        const double value = 2.0 * channel_radius_mm * h - h * h;
+        return value > 0.0 ? std::sqrt(value) : 0.0;
     }
 };
 

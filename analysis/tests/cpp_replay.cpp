@@ -1,23 +1,26 @@
-// Воспроизведение записи через НЕИЗМЕНЁННЫЕ алгоритмы C++ magma_vision (code/*.hpp).
+// Воспроизведение записи через алгоритмы C++ magma_vision (code/*.hpp) без камеры.
 //
-// Повторяет RunBurst() из magma_vision.cpp без камеры: на каждую серию новый FlowEstimator,
+// Повторяет RunBurst() из magma_vision.cpp: на каждую серию новый FlowEstimator,
 // профиль вдоль потока с каждого кадра, кромки уровня с каждого level_every-го кадра,
-// CombineLevelObservations (медиана), отчёт FormatVisionReport. Настройки читаются тем же
+// CombineLevelObservations (медиана), отчёт FormatVisionReport. При level.mode = axis_edge —
+// уровень «ось + край» (magma_axis_level.hpp), как в RunBurst. Настройки читаются тем же
 // ConfigFile и теми же ключами/умолчаниями, что в ApplySchedule/ApplyGeometryAndThresholds/
 // ApplyStrips/ApplyCalibration (ручная калибровка). Кадры приходят со stdin от cpp_feed.py:
 //   'B' uint32 n   - начало серии из n кадров
 //   uint32 w, uint32 h, double t, w*h байт  - кадр (серый) и его время, с
 //
-//   g++ -std=c++17 -O2 -I../../code cpp_replay.cpp -o cpp_replay
+//   g++ -std=c++20 -Wall -Wextra -Wpedantic -O2 -I../../code cpp_replay.cpp -o cpp_replay
 //   python3 cpp_feed.py video.mkv --burst 120 | ./cpp_replay magma_vision.conf
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "magma_axis_level.hpp"
 #include "magma_config.hpp"
 #include "magma_edge.hpp"
 #include "magma_flow.hpp"
@@ -46,6 +49,7 @@ int main(int argc, char** argv) {
     LauncherGeometry geometry;
     geometry.channel_radius_mm = config.GetDouble("geometry.channel_radius_mm", 150.0);
     geometry.max_level_mm = config.GetDouble("geometry.max_level_mm", 105.0);
+    geometry.wall_angle_deg = config.GetDouble("geometry.wall_angle_deg", 0.0);
     LevelConfig level_config;
     level_config.min_sharpness = config.GetDouble("level.min_sharpness", 5.0);
     level_config.melt_present_brightness = config.GetDouble("level.melt_present_brightness", 40.0);
@@ -53,9 +57,23 @@ int main(int argc, char** argv) {
     level_config.edge_sigma_px = config.GetDouble("level.edge_sigma_px", 0.2);
     level_config.systematic_sigma_mm = config.GetDouble("level.systematic_sigma_mm", 0.5);
     const double center_reference_px = config.GetDouble("level.center_reference_px", 0.0);
+    const bool axis_mode = config.GetString("level.mode", "edges").rfind("axis_edge", 0) == 0;
+    AxisEdgeConfig axis_config;
+    axis_config.bands = config.GetSize("level.axis.bands", 8);
+    axis_config.width_px = config.GetDouble("level.axis.width_px", 0.0);
+    axis_config.band_lines = config.GetSize("level.axis.band_lines", 5);
+    axis_config.edge_length_px = config.GetDouble("level.axis.edge_length_px", 800.0);
+    axis_config.edge_step_px = config.GetDouble("level.axis.edge_step_px", 2.0);
+    axis_config.edge_columns = config.GetSize("level.axis.edge_columns", 64);
+    axis_config.edge_side = config.GetInt("level.axis.edge_side", 0);
+    axis_config.min_contrast = config.GetDouble("level.axis.min_contrast", 5.0);
+    axis_config.min_columns = config.GetSize("level.axis.min_columns", 10);
+    axis_config.scale_across_mm_per_px = config.GetDouble("level.axis.scale_across_mm_per_px", 0.638);
+    axis_config.crust_mm = config.GetDouble("level.axis.crust_mm", 25.0);
     EdgeConfig edge_config;
     edge_config.smooth_radius = config.GetSize("edge.smooth_radius", 3);
     edge_config.min_gradient = config.GetDouble("edge.min_gradient", 3.0);
+    edge_config.min_gradient_noise = config.GetDouble("edge.min_gradient_noise", 0.0);
     edge_config.margin_fraction = config.GetDouble("edge.margin_fraction", 0.05);
     edge_config.min_separation = config.GetSize("edge.min_separation", 20);
     FlowConfig flow_config;   // mm_per_px в magma_vision.cpp не задаётся - остаётся 0.5333
@@ -93,10 +111,11 @@ int main(int argc, char** argv) {
 
     const std::size_t level_every =
         std::max<std::size_t>(1, burst_frames / std::max<std::size_t>(1, level_frames));
-    std::fprintf(stderr, "серия %zu кадров, прогрев %zu, уровень каждые %zu; полоса скорости "
+    std::fprintf(stderr, "серия %zu кадров, прогрев %zu, уровень каждые %zu (%s); полоса скорости "
                  "(%.0f,%.0f) угол %.1f длина %.0f ширина %.0f; калибровка β=%.1f° %.4f мм/px, "
                  "FlowConfig.mm_per_px=%.4f\n",
-                 burst_frames, warmup_frames, level_every, flow_strip.center_x_px, flow_strip.center_y_px,
+                 burst_frames, warmup_frames, level_every, axis_mode ? "ось + край" : "две кромки",
+                 flow_strip.center_x_px, flow_strip.center_y_px,
                  flow_strip.along_angle_deg, flow_strip.length_px, flow_strip.average_px,
                  calibration.elevation_deg, calibration.scale_mm_per_px, flow_config.mm_per_px);
 
@@ -107,7 +126,10 @@ int main(int argc, char** argv) {
         if (!ReadExact(&n, 4)) break;
         FlowEstimator flow(flow_config);
         EdgeFinder edges(edge_config);
+        std::optional<AxisEdgeLevel> axis_level;
+        if (axis_mode) axis_level.emplace(flow_strip, flow_config, axis_config);
         std::vector<EdgeObservation> observations;
+        std::size_t edge_frames = 0;
         double t_first = -1.0, t_last = 0.0;
         std::size_t used = 0;
         for (uint32_t i = 0; i < n; ++i) {
@@ -121,28 +143,41 @@ int main(int argc, char** argv) {
             if (t_first < 0) t_first = t;
             t_last = t;
             flow.AddProfile(ProfileExtractor::Extract(image, flow_strip), t - t_first);
-            if (used % level_every == 0) observations.push_back(edges.Find(image, level_strip));
+            const bool level_frame = used % level_every == 0;
+            if (axis_level) {
+                axis_level->AddFrame(image, t - t_first, level_frame);
+                edge_frames += level_frame;
+            } else if (level_frame) {
+                observations.push_back(edges.Find(image, level_strip));
+            }
             ++used;
         }
         const FlowResult fr = flow.Estimate();
 
-        // как CombineLevelObservations: медиана уровней по кадрам серии
-        const LevelEstimator level(geometry, level_config);
-        std::vector<LevelResult> per_frame;
-        for (const auto& o : observations) per_frame.push_back(level.Estimate(o, calibration, center_reference_px));
-        std::vector<std::pair<double, std::size_t>> ranked;
-        for (std::size_t i = 0; i < per_frame.size(); ++i)
-            if (per_frame[i].level_mm) ranked.push_back({*per_frame[i].level_mm, i});
-        LevelResult lr = per_frame.empty() ? LevelResult{} : per_frame.front();
-        if (!ranked.empty()) {
-            std::sort(ranked.begin(), ranked.end());
-            const double median = ranked[ranked.size() / 2].first;
-            std::size_t closest = ranked.front().second;
-            double gap = 1e300;
-            for (const auto& [v, idx] : ranked)
-                if (std::fabs(v - median) < gap) { gap = std::fabs(v - median); closest = idx; }
-            lr = per_frame[closest];
-            lr.level_mm = median;
+        LevelResult lr;
+        AxisEdgeDetail detail;
+        if (axis_level) {
+            lr = axis_level->Estimate(geometry, level_config, &detail);
+        } else {
+            // как CombineLevelObservations: медиана уровней по кадрам серии
+            const LevelEstimator level(geometry, level_config);
+            std::vector<LevelResult> per_frame;
+            for (const auto& o : observations)
+                per_frame.push_back(level.Estimate(o, calibration, center_reference_px));
+            std::vector<std::pair<double, std::size_t>> ranked;
+            for (std::size_t i = 0; i < per_frame.size(); ++i)
+                if (per_frame[i].level_mm) ranked.push_back({*per_frame[i].level_mm, i});
+            lr = per_frame.empty() ? LevelResult{} : per_frame.front();
+            if (!ranked.empty()) {
+                std::sort(ranked.begin(), ranked.end());
+                const double median = ranked[ranked.size() / 2].first;
+                std::size_t closest = ranked.front().second;
+                double gap = 1e300;
+                for (const auto& [v, idx] : ranked)
+                    if (std::fabs(v - median) < gap) { gap = std::fabs(v - median); closest = idx; }
+                lr = per_frame[closest];
+                lr.level_mm = median;
+            }
         }
 
         VisionReport r;
@@ -160,14 +195,33 @@ int main(int argc, char** argv) {
         r.level_disagreement_mm = lr.disagreement_mm;
         for (const auto& p : lr.participants)
             if (p.used) r.level_sources.push_back(p.name);
-        r.level_frames = observations.size();
+        r.level_frames = axis_level ? edge_frames : observations.size();
         r.camera_frames = used;
-        r.camera_fps = t_last > t_first ? (used - 1) / (t_last - t_first) : 0.0;
+        r.camera_fps = t_last > t_first ? static_cast<double>(used - 1) / (t_last - t_first) : 0.0;
         r.calibration_valid = true;
         r.calibration_beta_deg = calibration.elevation_deg;
         r.calibration_scale_mm_per_px = calibration.scale_mm_per_px;
         r.calibration_manual = true;
         std::printf("%s\n", FormatVisionReport(r).c_str());
+
+        if (axis_level) {
+            std::fprintf(stderr, "  t=%.2f с: скорость %s (snr %.1f); полосы:", t_first,
+                         fr.speed_ms ? std::to_string(*fr.speed_ms).c_str() : "нет", fr.snr);
+            for (std::size_t k = 0; k < detail.band_speed_ms.size(); ++k) {
+                if (detail.band_speed_ms[k])
+                    std::fprintf(stderr, " %.0f:%.2f", detail.band_offset_px[k], *detail.band_speed_ms[k]);
+                else
+                    std::fprintf(stderr, " %.0f:-", detail.band_offset_px[k]);
+            }
+            std::fprintf(stderr, "; ось %.1f px%s (%.2f м/с), край %.1f px (рваность %.0f, мест %zu), "
+                         "b %.1f мм -> %s %.1f±%.1f мм\n",
+                         detail.axis_offset_px.value_or(NAN), detail.axis_on_edge ? " (на краю)" : "",
+                         detail.axis_speed_ms.value_or(NAN), detail.edge_offset_px.value_or(NAN),
+                         detail.edge_ragged_px, detail.edge_columns_found,
+                         detail.half_width_mm.value_or(NAN), r.level_state.c_str(), r.level_mm,
+                         r.level_sigma_mm);
+            continue;
+        }
 
         // диагностика кромок: медианы по кадрам серии
         std::vector<double> nears, fars, sn, sf;
@@ -179,7 +233,7 @@ int main(int argc, char** argv) {
         }
         auto med = [](std::vector<double> v) {
             if (v.empty()) return -1.0;
-            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
             return v[v.size() / 2];
         };
         std::fprintf(stderr, "  t=%.2f с: скорость %s (snr %.1f, сдвиг %.2f px/кадр, %zu профилей, %zu интервалов); "
