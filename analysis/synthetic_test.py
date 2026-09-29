@@ -40,9 +40,9 @@ def main():
         cv2.circle(static, (cx, 140), 6, 200, -1)
 
     vw = cv2.VideoWriter(a.out, cv2.VideoWriter_fourcc(*"mp4v"), a.fps, (W, H))
-    uniq = 0
+    uniq, img = 0, None
     for i in range(n):
-        if a.dup_every and i % a.dup_every == a.dup_every - 1:
+        if a.dup_every and img is not None and i % a.dup_every == a.dup_every - 1:
             vw.write(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
             continue
         off = a.v * uniq

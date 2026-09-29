@@ -31,14 +31,19 @@ import sys
 import cv2
 import numpy as np
 
+from common import Timing, flow_affine, gray, parabola_vertex, read_frames, read_json, write_json
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def read_params(speed_dir):
+def read_speed_result(speed_dir):
+    """result.json от flow_speed; для старых результатов - ROI и угол из summary.txt."""
+    p = os.path.join(speed_dir, "result.json")
+    if os.path.isfile(p):
+        return read_json(p)
     txt = open(os.path.join(speed_dir, "summary.txt"), encoding="utf-8").read()
-    roi = tuple(int(v) for v in re.search(r"ROI: (\d+),(\d+),(\d+),(\d+)", txt).groups())
-    ang = float(re.search(r"Направление течения: ([-+]?\d+\.?\d*)°", txt).group(1))
-    return roi, ang
+    return dict(roi=[int(v) for v in re.search(r"ROI: (\d+),(\d+),(\d+),(\d+)", txt).groups()],
+                angle=float(re.search(r"Направление течения: ([-+]?\d+\.?\d*)°", txt).group(1)))
 
 
 def read_profile(speed_dir):
@@ -82,11 +87,14 @@ def main():
     ap.add_argument("--side", type=int, default=1, help="+1: камера видит правую половину чертежа")
     ap.add_argument("--k", default="0.67,0.85", help="отношение средней скорости к поверхностной (мин,макс)")
     ap.add_argument("--rho", type=float, default=3400.0, help="плотность шлака, кг/м3")
-    ap.add_argument("--start", type=float, default=0.0, help="начало участка, с (как в flow_speed)")
-    ap.add_argument("--seconds", type=float, default=0.0, help="длительность участка, с (0 = до конца)")
+    ap.add_argument("--start", type=float, help="начало участка, с (по умолчанию - как в result.json)")
+    ap.add_argument("--seconds", type=float, help="длительность участка, с (по умолчанию - как в result.json)")
     a = ap.parse_args()
 
-    (x, y, w, h), ang = read_params(a.speed_dir)
+    sp = read_speed_result(a.speed_dir)
+    (x, y, w, h), ang = sp["roi"], sp["angle"]
+    start = a.start if a.start is not None else sp.get("start", 0.0)
+    seconds = a.seconds if a.seconds is not None else sp.get("seconds", 0.0)
     yp, vp = read_profile(a.speed_dir)
     n_prof = yp - h / 2.0                        # смещение поперёк потока от центра ROI, px
 
@@ -95,10 +103,7 @@ def main():
     if 0 < i < len(vp) - 1:
         # вершина параболы по 3 точкам; шаг может быть неравномерным (полосы с редкой
         # текстурой flow_speed выбрасывает из profile.csv)
-        (x0, x1, x2), (y0, y1, y2) = n_prof[i - 1:i + 2], vp[i - 1:i + 2]
-        num_ = (x1 - x0) ** 2 * (y1 - y2) - (x1 - x2) ** 2 * (y1 - y0)
-        den = (x1 - x0) * (y1 - y2) - (x1 - x2) * (y1 - y0)
-        n_axis = x1 - 0.5 * num_ / den if den != 0 else x1
+        n_axis = parabola_vertex(n_prof[i - 1:i + 2], vp[i - 1:i + 2])
         axis_note = ""
     else:
         n_axis = n_prof[i]
@@ -106,46 +111,18 @@ def main():
     edge_sign = -1.0 if n_prof[np.argmin(vp)] < n_axis else 1.0   # в какую сторону от оси край
 
     # край корки: медиана кадров в повёрнутой системе (Y вдоль e2, как в flow_speed)
-    t = np.radians(ang)
-    e1 = np.array([np.cos(t), np.sin(t)])
-    e2 = np.array([-e1[1], e1[0]])
-    cx0, cy0 = x + w / 2.0, y + h / 2.0
     W = H = 1600
-    A = np.array([[e1[0], e2[0], cx0 - e1[0] * W / 2 - e2[0] * H / 2],
-                  [e1[1], e2[1], cy0 - e1[1] * W / 2 - e2[1] * H / 2]], np.float32)
+    A = flow_affine(x + w / 2.0, y + h / 2.0, ang, W, H)
+    tm = Timing(a.video, None, start, seconds)            # участок - так же, как в flow_speed
     cap = cv2.VideoCapture(a.video)
-    nfr = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    # участок [lo, hi) - так же, как в flow_speed: по меткам времени или по FPS
-    fcsv = os.path.join(os.path.dirname(os.path.abspath(a.video)), "frames.csv")
-    if os.path.isfile(fcsv):
-        with open(fcsv, newline="") as fh:
-            ts = np.array([float(r["time_rel_s"]) for r in csv.DictReader(fh)])
-        lo = int(np.searchsorted(ts, ts[0] + a.start))
-        hi = int(np.searchsorted(ts, ts[0] + a.start + a.seconds)) if a.seconds > 0 else len(ts)
-    else:
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0
-        if fps <= 0 and (a.start > 0 or a.seconds > 0):
-            sys.exit("Не удалось определить FPS для --start/--seconds")
-        lo = int(a.start * fps)
-        hi = int((a.start + a.seconds) * fps) if a.seconds > 0 else nfr
-    hi = min(hi, nfr)
-    if hi <= lo:
-        sys.exit(f"Пустой участок кадров {lo}..{hi} (в видео {nfr})")
-    frames, valid = [], None
-    for j in np.unique(np.linspace(lo, hi - 1, 60).astype(int)):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, j)
-        ok, f = cap.read()
-        if not ok:
-            continue
-        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)          # uint8: 60 кадров 1600x1600 без float-копий
-        if valid is None:
-            valid = cv2.warpAffine(np.ones_like(g), A, (W, H),
-                                   flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP) > 0
-        frames.append(cv2.warpAffine(g, A, (W, H), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP))
+    src_hw = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frames = read_frames(cap, np.unique(np.linspace(tm.lo, tm.hi - 1, 60).astype(int)),
+                         lambda f: cv2.warpAffine(gray(f), A, (W, H), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP))
     cap.release()
     if not frames:
-        sys.exit(f"Не удалось прочитать кадры {lo}..{hi - 1} из {a.video}")
-    med = np.median(np.array(frames), axis=0)
+        sys.exit(f"Не удалось прочитать кадры {tm.lo}..{tm.hi - 1} из {a.video}")
+    valid = cv2.warpAffine(np.ones(src_hw, np.uint8), A, (W, H), flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP) > 0
+    med = np.median(np.array(frames), axis=0)         # uint8: 60 кадров 1600x1600 без float-копий
     Y_axis = int(round(H / 2 + n_axis))
     edges = []
     for X in range(0, W, 4):
@@ -179,6 +156,8 @@ def main():
     order = np.argsort(r_prof)
     r_s, u_s = r_prof[order], u_prof[order]
     r_vis = abs(n_edge - n_axis) * a.scale_normal
+    P = gutter(a.profile)
+    prof_name = os.path.splitext(os.path.basename(a.profile))[0]
 
     head = [
         f"Результат скорости: {a.speed_dir}",
@@ -189,24 +168,30 @@ def main():
     ]
     speed_line = f"Скорость поверхности на оси: {u_prof.max():.2f} м/с; видимый край на {r_vis:.0f} мм от оси"
 
-    def write_out(lines):
+    res = dict(video=os.path.abspath(a.video), start=start, seconds=seconds, profile=prof_name,
+               axis_n=n_axis, axis_on_edge=bool(axis_note), edge_n=n_edge,
+               edge_p10=np.percentile(edges, 10), edge_p90=np.percentile(edges, 90),
+               visible_half_mm=r_vis, crust_mm=a.crust, b_mm=b, v_axis_m_s=u_prof.max(),
+               **{k: sp.get(k) for k in ("pairs", "windows", "good_windows", "consensus_px_s",
+                                         "methods_spread_pct", "core_px_s")})
+
+    def write_out(lines, **extra):
         txt = "\n".join(lines)
         print(txt)
         with open(os.path.join(a.speed_dir, "flow_rate.txt"), "w", encoding="utf-8") as f:
             f.write(txt + "\n")
+        write_json(os.path.join(a.speed_dir, "flow_rate.json"), {**res, **extra})
         vis = cv2.cvtColor(cv2.normalize(med, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), cv2.COLOR_GRAY2BGR)
         for nn, col in ((n_axis, (0, 200, 0)), (n_edge, (0, 0, 255))):
             cv2.line(vis, (0, int(H / 2 + nn)), (W - 1, int(H / 2 + nn)), col, 2)
         cv2.imwrite(os.path.join(a.speed_dir, "level_check.png"), vis[::2, ::2])
 
-    P = gutter(a.profile)
-    prof_name = os.path.splitext(os.path.basename(a.profile))[0]
     z = level_from_half_width(P, b, a.side)
     if not np.isfinite(z):
         # скорость, ось и край всё равно пишем: по ним collect_metrics ставит оценку
         write_out(head + [f"Уровень: не определён - b больше максимальной полуширины профиля {prof_name} "
                           f"({np.abs(P[:, 0]).max():.0f} мм); край или ось найдены неверно",
-                          speed_line])
+                          speed_line], level_mm=None)
         sys.exit(1)
     xs = np.linspace(P[:, 0].min(), P[:, 0].max(), 4000)
     zb = np.interp(xs, P[:, 0], P[:, 1])
@@ -219,9 +204,8 @@ def main():
         r = np.abs(r)
         u = np.interp(r, r_s, u_s)
         # за последней точкой профиля - линейный спад до 0 у стенки
-        last_r, last_u = r_s[-1], u_s[-1]
-        tail = r > last_r
-        u[tail] = last_u * np.clip((bw - r[tail]) / max(bw - last_r, 1e-6), 0, 1)
+        tail = r > r_s[-1]
+        u[tail] = u_s[-1] * np.clip((bw - r[tail]) / max(bw - r_s[-1], 1e-6), 0, 1)
         return u
 
     u_x = np.where(xs >= 0, u_at(xs, bR), u_at(xs, bL))
@@ -236,7 +220,9 @@ def main():
         f"Средняя по сечению скорость поверхности (взвешенная по глубине): {u_mean_s:.2f} м/с",
         f"Расход при k = {kmin:g}..{kmax:g}: {q_surf * kmin * 1000:.1f}..{q_surf * kmax * 1000:.1f} л/с"
         f" = {q_surf * kmin * a.rho * 3.6:.0f}..{q_surf * kmax * a.rho * 3.6:.0f} т/ч (ρ = {a.rho:g} кг/м³)",
-    ])
+    ], level_mm=z, area_cm2=area * 1e4, wet_left_mm=bL, wet_right_mm=bR, u_surface_mean_m_s=u_mean_s,
+       k=[kmin, kmax], rho=a.rho, q_l_s=[q_surf * kmin * 1000, q_surf * kmax * 1000],
+       t_h=[q_surf * kmin * a.rho * 3.6, q_surf * kmax * a.rho * 3.6])
 
 if __name__ == "__main__":
     main()
