@@ -76,12 +76,12 @@ def parse_roi(s):
     return x, y, w, h
 
 
-def auto_roi(video, consecutive, nframes, samples=120, dup_thr=1.0):
+def auto_roi(video, consecutive, nframes, samples=120, dup_thr=1.0, lo=1):
     """ROI по карте движения: средний |I(t)-I(t-1)| по парам соседних кадров,
     разбросанных по всему видео; берётся рамка самой большой подвижной области."""
     cap = cv2.VideoCapture(video)
     acc, cnt = None, 0
-    for j in np.linspace(1, max(1, nframes - 1), samples).astype(int):
+    for j in np.linspace(max(1, lo), max(1, nframes - 1), samples).astype(int):
         if not consecutive(j):
             k = j + 1
             while k < nframes and not consecutive(k) and k < j + 400:
@@ -342,12 +342,6 @@ def main():
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if not fps or fps <= 0:
         sys.exit("Не удалось определить FPS")
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(a.start * fps))
-    ok, frame = cap.read()
-    if not ok:
-        sys.exit("Не удалось прочитать кадр")
-    print(f"{os.path.basename(video)}: {frame.shape[1]}x{frame.shape[0]}, {fps:.2f} fps, {nframes} кадров")
-
     fcsv = a.frames_csv or os.path.join(os.path.dirname(os.path.abspath(video)), "frames.csv")
     TS = None
     if os.path.isfile(fcsv):
@@ -365,6 +359,22 @@ def main():
         if len(TS) != nframes:
             print(f"  ВНИМАНИЕ: в видео {nframes} кадров, в frames.csv {len(TS)}")
 
+
+    # участок анализа [s_idx, e_idx) - по меткам времени, если они есть
+    if TS is not None:
+        s_idx = int(np.searchsorted(TS, TS[0] + a.start))
+        e_idx = int(np.searchsorted(TS, TS[0] + a.start + a.max_seconds)) if a.max_seconds > 0 else len(TS)
+    else:
+        s_idx = int(a.start * fps)
+        e_idx = int((a.start + a.max_seconds) * fps) if a.max_seconds > 0 else nframes
+    e_idx = min(e_idx, nframes)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, s_idx)
+    ok, frame = cap.read()
+    if not ok:
+        sys.exit("Не удалось прочитать кадр")
+    print(f"{os.path.basename(video)}: {frame.shape[1]}x{frame.shape[0]}, {nframes} кадров, "
+          f"участок кадров {s_idx}..{e_idx}")
+
     def frame_time(i):
         return TS[i] if TS is not None else i / fps
 
@@ -375,7 +385,7 @@ def main():
     out = a.out or os.path.splitext(video)[0] + "_speed"
     os.makedirs(out, exist_ok=True)
     if a.roi == "auto":
-        roi, mmap = auto_roi(video, consecutive, nframes, dup_thr=a.dup_thr)
+        roi, mmap = auto_roi(video, consecutive, e_idx, dup_thr=a.dup_thr, lo=s_idx + 1)
         if mmap is not None:
             cv2.imwrite(os.path.join(out, "motion_map.png"),
                         cv2.normalize(mmap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
@@ -391,7 +401,7 @@ def main():
     cv2.imwrite(os.path.join(out, "roi.png"), vis)
 
     i0 = int(round(cap.get(cv2.CAP_PROP_POS_FRAMES))) - 1        # номер кадра `frame`
-    limit = int(a.max_seconds * fps) if a.max_seconds > 0 else None
+    limit = e_idx - s_idx - 1
     alpha = 1.0 / (a.bg_tau * fps) if a.bg_tau > 0 else 0.0
     hann = cv2.createHanningWindow((w, h), cv2.CV_32F)
     band_edges = np.linspace(0, h, a.bands + 1).astype(int)

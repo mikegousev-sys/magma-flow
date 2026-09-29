@@ -83,6 +83,8 @@ def main():
     ap.add_argument("--side", type=int, default=1, help="+1: камера видит правую половину чертежа")
     ap.add_argument("--k", default="0.67,0.85", help="отношение средней скорости к поверхностной (мин,макс)")
     ap.add_argument("--rho", type=float, default=3400.0, help="плотность шлака, кг/м3")
+    ap.add_argument("--start", type=float, default=0.0, help="начало участка, с (как в flow_speed)")
+    ap.add_argument("--seconds", type=float, default=0.0, help="длительность участка, с (0 = до конца)")
     a = ap.parse_args()
 
     (x, y, w, h), ang = read_params(a.speed_dir)
@@ -112,8 +114,15 @@ def main():
                   [e1[1], e2[1], cy0 - e1[1] * W / 2 - e2[1] * H / 2]], np.float32)
     cap = cv2.VideoCapture(a.video)
     nfr = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    lo, hi = 0, nfr
+    fcsv = os.path.join(os.path.dirname(os.path.abspath(a.video)), "frames.csv")
+    if os.path.isfile(fcsv):
+        ts = np.array([float(r["time_rel_s"]) for r in csv.DictReader(open(fcsv))])
+        lo = int(np.searchsorted(ts, ts[0] + a.start))
+        hi = int(np.searchsorted(ts, ts[0] + a.start + a.seconds)) if a.seconds > 0 else len(ts)
+        hi = min(hi, nfr)
     frames, valid = [], None
-    for j in np.linspace(0, nfr - 1, 60).astype(int):
+    for j in np.linspace(lo, hi - 1, 60).astype(int):
         cap.set(cv2.CAP_PROP_POS_FRAMES, j)
         ok, f = cap.read()
         if not ok:
