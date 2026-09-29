@@ -79,7 +79,7 @@ def main():
     ap.add_argument("--scale-along", type=float, default=0.548, help="мм/px вдоль потока")
     ap.add_argument("--scale-normal", type=float, default=0.638, help="мм/px поперёк потока")
     ap.add_argument("--crust", type=float, default=25.0, help="на сколько корка заходит на жидкость, мм")
-    ap.add_argument("--profile", default=os.path.join(HERE, "gutter_profile_BB.csv"))
+    ap.add_argument("--profile", default=os.path.join(HERE, "gutter_profile_R150.csv"))
     ap.add_argument("--side", type=int, default=1, help="+1: камера видит правую половину чертежа")
     ap.add_argument("--k", default="0.67,0.85", help="отношение средней скорости к поверхностной (мин,макс)")
     ap.add_argument("--rho", type=float, default=3400.0, help="плотность шлака, кг/м3")
