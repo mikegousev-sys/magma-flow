@@ -428,6 +428,20 @@ SSH-ключом-паттерном (`~/.ssh/id_ed25519_github`, свой отд
   `~/bin/arduino-cli`. Загрузка без графики (`multi-user.target`); отключены
   (не удалены) lightdm, wayvnc, cups, bluetooth, cloud-init, nfs/rpcbind,
   glamor-test, rp1-test. Занятая RAM после загрузки 515 → 239 МБ.
+- **Мягкий старт (против просадки питания при включении):** загрузка идёт
+  на минимальной частоте CPU 1.5 ГГц (вместо 2.4): в
+  `/boot/firmware/cmdline.txt` добавлен `cpufreq.default_governor=powersave`
+  (копия `cmdline.txt.bak-pre-powersave`). Системное правило
+  `/usr/lib/udev/rules.d/60-ondemand-governor.rules` сразу возвращало
+  `ondemand` — перекрыто пустым файлом с тем же именем в
+  `/etc/udev/rules.d/`. Через 30 с после `multi-user.target`
+  `magma-cpufreq-normal.service` включает `ondemand` (без камеры это ~79 с
+  от включения, т.к. `magma-camera-init` ~45 с ищет камеру; с камерой ~35 с).
+  Откат: удалить параметр из cmdline, файл из `/etc/udev/rules.d/` и
+  `systemctl disable magma-cpufreq-normal`.
+- **Bluetooth выключен аппаратно:** `dtoverlay=disable-bt` в
+  `/boot/firmware/config.txt` (копия `config.txt.bak-pre-disable-bt`),
+  `/sys/class/bluetooth` отсутствует. Wi-Fi оставлен как запасной доступ.
 - **Не проверено (железа нет на плате):** камера (на I2C-шинах 4/6/10/11 —
   ни одного устройства) и Arduino. Когда подключат — проверить захват
   кадров (`/dev/video0`, отчёт `magma-vision`) и приём АЦП.
@@ -435,7 +449,11 @@ SSH-ключом-паттерном (`~/.ssh/id_ed25519_github`, свой отд
   перезагрузки Pi (восстанавливалась только после ручной перезагрузки,
   у ПК при этом менялся адрес в `10.12.194.0/28`). Причина не выяснена —
   подозрение на `rpi-usb-gadget-ics.service` (переключатель client/shared)
-  или кабель/питание от порта ПК.
+  или кабель/питание от порта ПК. Для диагностики включены постоянный
+  журнал (`/var/log/journal`, переживает перезагрузку) и подробный лог
+  переключателя (`ICS_DEBUG=1`, drop-in
+  `/etc/systemd/system/rpi-usb-gadget-ics.service.d/debug.conf`) — после
+  следующего обрыва смотреть `journalctl -b -1 -u rpi-usb-gadget-ics`.
 
 ## 10. Текущая незавершённая задача
 
