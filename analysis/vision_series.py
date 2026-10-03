@@ -289,7 +289,7 @@ class SeriesProcessor:
                               methods_ms=dict(kymo=ms(v_all), phase=ms(v_ph), lk=ms(v_lk), piv=ms(v_piv)),
                               spread_pct=spread, agree=bool(np.isfinite(spread) and spread <= self.agree_pct),
                               texture=tex, compute_ms=comp_ms, budget_ms=self.budget_ms),
-            flow_rate={k: lvl.get(k) for k in ("level_mm", "b_mm", "edge_ragged_px", "area_cm2", "q_l_s",
+            flow_rate={k: lvl.get(k) for k in ("level_mm", "b_mm", "edge_ragged_px", "visible_half_px", "crust_mm", "area_cm2", "q_l_s",
                                                "t_h", "k", "rho")} | dict(valid=lvl["valid"]))
         return report, comp_ms
 
@@ -333,7 +333,7 @@ class SeriesProcessor:
         o = np.argsort(r)
         q = surface_flow(xs, dep, r[o], vb[fin][o] * self.mm / 1000.0, bL, bR)
         L.update(valid=not on_edge, state="unreliable" if on_edge else "measured", level_mm=z, sigma_mm=sigma,
-                 b_mm=b, edge_ragged_px=ragged, area_cm2=area * 1e4, k=self.k, rho=self.rho,
+                 b_mm=b, edge_ragged_px=ragged, visible_half_px=d, crust_mm=self.crust, area_cm2=area * 1e4, k=self.k, rho=self.rho,
                  q_l_s=[q * k * 1000 for k in self.k], t_h=[q * k * self.rho * 3.6 for k in self.k])
         # в отчёт - медиана последних пересчётов (как CombineLevelObservations в C++: медиана,
         # остальные поля - от пересчёта, ближайшего к ней)
