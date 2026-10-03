@@ -257,7 +257,7 @@ private:
         axis_config_.min_columns = config_.GetSize("level.axis.min_columns", 10);
         axis_config_.scale_across_mm_per_px =
             config_.GetDouble("level.axis.scale_across_mm_per_px", 0.638);
-        axis_config_.crust_mm = config_.GetDouble("level.axis.crust_mm", 25.0);
+        axis_config_.crust_mm = config_.GetDouble("level.axis.crust_mm", 15.0);
 
         edge_config_.smooth_radius = config_.GetSize("edge.smooth_radius", 3);
         edge_config_.min_gradient = config_.GetDouble("edge.min_gradient", 3.0);

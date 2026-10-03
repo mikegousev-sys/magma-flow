@@ -205,9 +205,9 @@ class SeriesProcessor:
         self.agree_pct = c("series.agree_pct", 10.0)
         self.budget_ms = c("schedule.burst_interval_s", 0.2) * 1000
         self.level_every = c("series.level_every_s", 1.0)
-        self.crust, self.side = c("series.crust_mm", 25.0), int(c("series.profile_side", 1))
+        self.crust, self.side = c("series.crust_mm", 15.0), int(c("series.profile_side", 1))
         self.k = [float(v) for v in c("series.k", "0.67,0.85", str).split(",")]
-        self.rho = c("series.rho", 3400.0)
+        self.rho = c("series.rho", 3500.0)
         prof = c("series.gutter_profile", "gutter_profile_R150.csv", str)
         self.P = gutter(prof if os.path.isabs(prof) else os.path.join(HERE, prof))
         self.level_window = c("series.level_window_s", 5.0)

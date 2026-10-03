@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     axis_config.min_contrast = config.GetDouble("level.axis.min_contrast", 5.0);
     axis_config.min_columns = config.GetSize("level.axis.min_columns", 10);
     axis_config.scale_across_mm_per_px = config.GetDouble("level.axis.scale_across_mm_per_px", 0.638);
-    axis_config.crust_mm = config.GetDouble("level.axis.crust_mm", 25.0);
+    axis_config.crust_mm = config.GetDouble("level.axis.crust_mm", 15.0);
     EdgeConfig edge_config;
     edge_config.smooth_radius = config.GetSize("edge.smooth_radius", 3);
     edge_config.min_gradient = config.GetDouble("edge.min_gradient", 3.0);
